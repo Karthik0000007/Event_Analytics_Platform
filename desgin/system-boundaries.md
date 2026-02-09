@@ -1,25 +1,23 @@
 ## Decision
-Define strict boundaries between event producers, ingestion API, message broker, consumers, and storage.
+Define strict boundaries between event producers, ingestion API, message broker, consumer services, and storage systems.
 
 ## Context
-- Async systems fail at boundaries.
-- Ambiguous ownership causes data loss.
-- This system must be debuggable by on-call engineers.
+- Distributed systems fail most often at unclear ownership boundaries.
+- Async pipelines require explicit responsibility separation.
+- Failure would look like unclear debugging paths or silent data loss.
 
 ## Options Considered
-1. Tight coupling between services
-2. Fully decoupled async pipeline
-3. Shared database writes
+1. Tight coupling between producers and database
+2. Shared database writes across services
+3. Fully decoupled async pipeline using a message broker
 
 ## Choice & Rationale
-- Fully decoupled async pipeline.
-- Kafka as durability boundary.
-- Consumers are stateless and restartable.
+- Selected a fully decoupled async pipeline.
+- Ingestion API owns validation and acceptance.
+- Message broker acts as the durability boundary.
+- Consumer services own persistence and correctness.
+- Storage systems are isolated from producers.
 
 ## Trade-offs Accepted
 - Eventual consistency.
-- More components to operate.
-
-## Revisit Conditions
-- Strong real-time requirements.
-- Need for exactly-once semantics.
+- Additional oper

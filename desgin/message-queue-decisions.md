@@ -1,10 +1,11 @@
 ## Decision
-Use Kafka with at-least-once delivery semantics and explicit consumer offset management.
+Use Kafka with at-least-once delivery semantics and explicit producer acknowledgments and consumer offset management.
 
 ## Context
-- Events must not be lost.
+- Events must not be lost under failures.
 - Consumers may crash or restart.
 - Backpressure must be handled safely.
+- Failure would look like silent loss or stuck partitions.
 
 ## Options Considered
 1. At-most-once delivery
@@ -13,13 +14,13 @@ Use Kafka with at-least-once delivery semantics and explicit consumer offset man
 
 ## Choice & Rationale
 - At-least-once ensures durability.
-- Duplicate events are handled via idempotency.
-- Operational complexity remains manageable.
+- Duplicate events are acceptable when combined with idempotent consumers.
+- Avoids the operational and conceptual complexity of exactly-once semantics.
 
 ## Trade-offs Accepted
-- Duplicate processing.
-- Slightly more complex consumers.
+- Duplicate event processing.
+- Additional logic for idempotency.
 
 ## Revisit Conditions
 - Financial transactions.
-- Strong regulatory constraints.
+- Regulatory or compliance-driven guarantees.
