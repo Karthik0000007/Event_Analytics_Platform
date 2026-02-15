@@ -586,11 +586,11 @@ graph TD
     Layout --> Header
     Layout --> Outlet
 
-    Outlet --> Dashboard[/ Dashboard]
-    Outlet --> Events[/events Events]
-    Outlet --> EventDetail[/events/:id EventDetail]
-    Outlet --> Analytics[/analytics Analytics]
-    Outlet --> DLQ[/dlq Dead Letters]
+    Outlet --> Dashboard["/ Dashboard"]
+    Outlet --> Events["/events Events"]
+    Outlet --> EventDetail["/events/:id EventDetail"]
+    Outlet --> Analytics["/analytics Analytics"]
+    Outlet --> DLQ["/dlq Dead Letters"]
 
     Dashboard --> StatsCard
     Dashboard --> TimelineChart
