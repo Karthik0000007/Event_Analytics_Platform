@@ -17,6 +17,12 @@ coverage.out
 # Dependency directories
 Godeps/
 
+# Node / Frontend
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+
 # IDEs and editors
 .vscode/
 .idea/

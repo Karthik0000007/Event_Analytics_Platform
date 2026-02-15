@@ -1,0 +1,5 @@
+The `/Event_Analytics_Platform/Event_Analytics_Platform/cmd` directory is intended to contain the main application binaries for the backend services. Since you requested to create a new workspace for the frontend application, this directory should remain empty as it is not directly related to the frontend.
+
+Here is the content for the `cmd` directory:
+
+# This directory is intentionally left blank.
