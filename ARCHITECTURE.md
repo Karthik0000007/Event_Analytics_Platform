@@ -1,9 +1,9 @@
 # Event Analytics Platform — Technical Documentation
 
-> **Version:** 1.0  
-> **Last updated:** 2026-02-11  
-> **Language / Runtime:** Go 1.25 · Kafka (Confluent 7.5) · PostgreSQL 15  
-> **Architecture style:** Event-driven, two-service async pipeline  
+> **Version:** 1.1  
+> **Last updated:** 2026-02-16  
+> **Language / Runtime:** Go 1.25 · Kafka (Confluent 7.5) · PostgreSQL 15 · React 18 + TypeScript  
+> **Architecture style:** Event-driven, two-service async pipeline with analytics frontend  
 
 ---
 
@@ -17,7 +17,8 @@
 6. [Failure & Edge Case Analysis](#6-failure--edge-case-analysis)  
 7. [Security Considerations](#7-security-considerations)  
 8. [Developer Onboarding Guide](#8-developer-onboarding-guide)  
-9. [Suggested Improvements](#9-suggested-improvements)  
+9. [Frontend Architecture](#9-frontend-architecture)  
+10. [Suggested Improvements](#10-suggested-improvements)  
 
 ---
 
@@ -25,9 +26,9 @@
 
 ### Purpose
 
-The Event Analytics Platform is a **production-grade event ingestion and processing backend** designed for marketplace-style applications. It accepts high-volume, bursty event traffic via a REST API, buffers events through Kafka, and persists them durably into PostgreSQL with at-least-once delivery guarantees.
+The Event Analytics Platform is a **production-grade event ingestion and processing system** designed for marketplace-style applications. It accepts high-volume, bursty event traffic via a REST API, buffers events through Kafka, persists them durably into PostgreSQL with at-least-once delivery guarantees, and surfaces the data through a **React-based analytics dashboard**.
 
-The system is intentionally scoped to the **backend pipeline only** — no dashboards, no query layer, no analytics UI. The focus is on correctness, durability, operational safety, and debuggability under failure.
+The backend focuses on correctness, durability, operational safety, and debuggability under failure. The frontend provides real-time visibility into the event pipeline with interactive charts, paginated event browsing, and aggregated analytics.
 
 ### High-Level Architecture
 
@@ -55,12 +56,18 @@ flowchart LR
         PG[(PostgreSQL<br/>events table)]
     end
 
+    subgraph Frontend
+        UI[React Dashboard<br/>:3000]
+    end
+
     P1 -->|POST /v1/events| API
     P2 -->|POST /v1/events| API
     API -->|async publish| K
     K -->|fetch + manual commit| C
     C -->|INSERT idempotent| PG
     C -->|poison pill /<br/>retries exhausted| DLQ
+    UI -->|GET /v1/events<br/>GET /v1/analytics/*| API
+    API -->|query| PG
 ```
 
 ### Core Responsibilities
@@ -72,6 +79,7 @@ flowchart LR
 | Deserialization, persistence, correctness | Event Consumer |
 | Idempotent storage with conflict resolution | PostgreSQL |
 | Failed message isolation | DLQ (events.dlq topic) |
+| Event browsing, analytics visualization | Frontend Dashboard |
 
 ---
 
@@ -85,8 +93,9 @@ A stateless HTTP server built on [chi](https://github.com/go-chi/chi). Receives 
 
 Key files:
 - `cmd/ingestion_api/main.go` — HTTP server bootstrap  
-- `internal/api/router.go` — Route registration (chi)  
-- `internal/api/handlers/event.go` — Event handler with validation  
+- `internal/api/router.go` — Route registration (chi), CORS middleware  
+- `internal/api/handlers/event.go` — Event handler with validation (POST)  
+- `internal/api/handlers/query.go` — Query handlers for events & analytics (GET)  
 - `internal/api/middleware/request_id.go` — X-Request-ID propagation  
 - `internal/api/middleware/logging.go` — Request/response timing  
 
@@ -120,7 +129,16 @@ All Kafka writers use `RequiredAcks: RequireAll` (ISR acknowledgment) and `Least
 
 #### Storage Layer (`internal/storage`)
 
-Thin wrapper over `database/sql` targeting PostgreSQL. Connection pool tuned to 25 open / 5 idle / 5-minute lifetime. Single write method `InsertEvent()` uses `ON CONFLICT (event_id) DO NOTHING` for idempotency.
+Thin wrapper over `database/sql` targeting PostgreSQL. Connection pool tuned to 25 open / 5 idle / 5-minute lifetime.
+
+| Method | Purpose |
+|---|---|
+| `InsertEvent()` | Idempotent upsert via `ON CONFLICT (event_id) DO NOTHING` |
+| `GetEvents()` | Paginated, filterable event listing (type, date range) |
+| `GetEvent()` | Single event lookup by UUID |
+| `GetSummary()` | Aggregate stats: total, today, distinct types, top 5 |
+| `GetTypeCounts()` | Event counts grouped by `event_type` |
+| `GetTimeline()` | Hourly event counts for a configurable window |
 
 #### Configuration (`internal/config`)
 
@@ -137,11 +155,14 @@ graph TD
     API --> HANDLERS[internal/api/handlers]
     API --> HEALTH[internal/health]
     HANDLERS --> MSG[internal/messaging]
+    HANDLERS --> STORE[internal/storage]
 
     CMD_CON[cmd/event-consumer] --> CFG
     CMD_CON --> LOG
     CMD_CON --> MSG
-    CMD_CON --> STORE[internal/storage]
+    CMD_CON --> STORE
+
+    FRONTEND[Frontend SPA] -->|HTTP fetch| API
 
     MSG --> KAFKA_GO[segmentio/kafka-go]
     STORE --> LIB_PQ[lib/pq]
@@ -150,6 +171,7 @@ graph TD
     style CMD_CON fill:#4a9eff,color:#fff
     style MSG fill:#ff9f43,color:#fff
     style STORE fill:#2ecc71,color:#fff
+    style FRONTEND fill:#6366f1,color:#fff
 ```
 
 ### External Integrations
@@ -474,6 +496,16 @@ curl -X POST http://localhost:8080/v1/events \
   -d '{"event_id":"550e8400-e29b-41d4-a716-446655440000","event_type":"click","payload":{"page":"/home"}}'
 ```
 
+**6. Start the frontend:**
+
+```bash
+cd Event_Analytics_Platform/frontend
+npm install
+npm run dev
+```
+
+The dashboard opens at http://localhost:3000. The Vite dev server proxies all `/v1/*` API calls to the Go backend on `:8080`.
+
 ### Environment Variables
 
 | Variable | Default | Used By | Description |
@@ -526,7 +558,124 @@ The test suite includes 27 tests covering:
 
 ---
 
-## 9. Suggested Improvements
+## 9. Frontend Architecture
+
+### Overview
+
+The frontend is a **single-page application** built with React 18 and TypeScript, bundled by Vite. It connects to the Ingestion API's read endpoints to provide real-time event browsing, analytics dashboards, and system health monitoring.
+
+### Tech Stack
+
+| Technology | Purpose |
+|---|---|
+| **React 18** | UI framework with functional components and hooks |
+| **React Router v6** | Client-side routing with nested layout routes |
+| **Recharts** | Charting library (Area, Pie, Bar charts) |
+| **Lucide React** | Icon library |
+| **date-fns** | Date formatting and relative time |
+| **TypeScript** | Static type safety across all components |
+| **Vite** | Dev server with HMR + API proxy to Go backend |
+
+### Page Architecture
+
+```mermaid
+graph TD
+    BrowserRouter --> Layout
+
+    Layout --> Sidebar
+    Layout --> Header
+    Layout --> Outlet
+
+    Outlet --> Dashboard[/ Dashboard]
+    Outlet --> Events[/events Events]
+    Outlet --> EventDetail[/events/:id EventDetail]
+    Outlet --> Analytics[/analytics Analytics]
+    Outlet --> DLQ[/dlq Dead Letters]
+
+    Dashboard --> StatsCard
+    Dashboard --> TimelineChart
+    Dashboard --> TypePieChart
+    Dashboard --> EventTable
+
+    Events --> Filters
+    Events --> EventTable2[EventTable]
+
+    Analytics --> TimelineChart2[TimelineChart]
+    Analytics --> TypePieChart2[TypePieChart]
+    Analytics --> TypeBarChart
+
+    style Layout fill:#6366f1,color:#fff
+    style Dashboard fill:#22d3ee,color:#000
+    style Events fill:#22d3ee,color:#000
+    style Analytics fill:#22d3ee,color:#000
+```
+
+### API Integration
+
+The frontend uses a custom `useApi` hook for data fetching with automatic loading/error state management. All API calls go through fetch-based typed service functions.
+
+| Frontend Page | Backend Endpoint | Data |
+|---|---|---|
+| Dashboard | `GET /v1/analytics/summary` | Total events, today count, distinct types |
+| Dashboard | `GET /v1/analytics/timeline?hours=24` | Event volume chart data |
+| Dashboard | `GET /v1/analytics/types` | Type distribution for pie chart |
+| Dashboard | `GET /v1/events?limit=10` | Recent events table |
+| Events | `GET /v1/events?type=&from=&to=&limit=&offset=` | Paginated, filtered event list |
+| Event Detail | `GET /v1/events/{id}` | Single event with full payload |
+| Analytics | `GET /v1/analytics/summary` | Summary statistics |
+| Analytics | `GET /v1/analytics/timeline?hours=N` | Configurable timeline (6h–7d) |
+| Analytics | `GET /v1/analytics/types` | Type distribution (pie + bar) |
+| All pages | `GET /healthz` | Backend health status in header |
+
+### Component Hierarchy
+
+| Component | Type | Responsibility |
+|---|---|---|
+| `Layout` | Layout | Sidebar + Header + routed content via `<Outlet>` |
+| `Sidebar` | Navigation | App navigation with active route highlighting |
+| `Header` | Chrome | Page title + live health badge (polls every 30s) |
+| `StatsCard` | Data display | Single metric with icon, value, and optional trend |
+| `EventTable` | Data display | Clickable event rows with type badges, truncated payloads |
+| `EventChart` | Visualization | Timeline (Area), type distribution (Pie), type counts (Bar) |
+| `Filters` | Input | Type select, date range pickers, search/clear actions |
+| `Loading` | Feedback | Spinner with configurable message |
+| `StatusBadge` | Feedback | Color-coded status indicator |
+
+### Dev Server Proxy
+
+Vite proxies API requests to the Go backend during development:
+
+```typescript
+// vite.config.ts
+server: {
+  port: 3000,
+  proxy: {
+    '/v1':      { target: 'http://localhost:8080' },
+    '/healthz': { target: 'http://localhost:8080' },
+    '/readyz':  { target: 'http://localhost:8080' },
+  }
+}
+```
+
+This means the frontend dev server runs on `:3000` and all `/v1/*` requests are forwarded to the Go API on `:8080`, avoiding CORS issues during development.
+
+### Styling
+
+The frontend uses a CSS custom properties-based dark theme with no CSS framework:
+
+| Variable | Value | Purpose |
+|---|---|---|
+| `--bg` | `#0f1117` | Page background |
+| `--surface` | `#1a1d27` | Card/sidebar background |
+| `--accent` | `#6366f1` | Primary accent (indigo) |
+| `--text` | `#e4e5e9` | Primary text |
+| `--text-dim` | `#8b8d97` | Secondary text |
+
+The layout is responsive — the sidebar collapses on screens below 768px.
+
+---
+
+## 10. Suggested Improvements
 
 ### Critical (Correctness)
 
@@ -568,18 +717,16 @@ The test suite includes 27 tests covering:
 
 ```mermaid
 graph LR
-    A[Current:<br/>2-service pipeline] --> B[Add metrics<br/>+ tracing]
+    A[Current:<br/>2-service pipeline<br/>+ analytics frontend] --> B[Add metrics<br/>+ tracing]
     B --> C[Add auth<br/>+ rate limiting]
     C --> D[Schema registry<br/>for payload validation]
     D --> E[DLQ consumer<br/>for replay/alerting]
-    E --> F[Read path:<br/>query API + caching]
 
     style A fill:#3498db,color:#fff
     style B fill:#e67e22,color:#fff
     style C fill:#e67e22,color:#fff
     style D fill:#95a5a6,color:#fff
     style E fill:#95a5a6,color:#fff
-    style F fill:#95a5a6,color:#fff
 ```
 
 ---
@@ -593,8 +740,9 @@ Event_Analytics_Platform/
 │   └── event-consumer/main.go       # Kafka consumer binary
 ├── internal/
 │   ├── api/
-│   │   ├── router.go                # Chi route registration
+│   │   ├── router.go                # Chi route registration + CORS
 │   │   ├── handlers/event.go        # POST /v1/events handler
+│   │   ├── handlers/query.go        # GET /v1/events, /v1/analytics/* handlers
 │   │   └── middleware/
 │   │       ├── logging.go           # Request duration logging
 │   │       ├── request_id.go        # X-Request-ID propagation
@@ -613,16 +761,45 @@ Event_Analytics_Platform/
 │   │   ├── retry_test.go            # Retry discipline tests
 │   │   ├── dlq_test.go              # DLQ envelope tests
 │   │   └── failure_injection_test.go # 8 failure scenario tests
-│   ├── storage/postgres.go          # PostgreSQL client (idempotent insert)
+│   ├── storage/postgres.go          # PostgreSQL client (insert + query layer)
 │   └── validation/even.go           # (empty stub)
 ├── migrations/
 │   ├── 000001_create_events_table.up.sql
 │   └── 000001_create_events_table.down.sql
+├── Event_Analytics_Platform/frontend/
+│   ├── index.html                   # Vite entry point
+│   ├── package.json                 # React 18, Router 6, Recharts, Lucide, date-fns
+│   ├── vite.config.ts               # Dev server + API proxy to :8080
+│   ├── tsconfig.json                # Strict TypeScript config
+│   └── src/
+│       ├── main.tsx                 # React root mount
+│       ├── App.tsx                  # BrowserRouter + route definitions
+│       ├── components/
+│       │   ├── Layout.tsx           # Sidebar + Header + Outlet
+│       │   ├── Sidebar.tsx          # Navigation with active route highlighting
+│       │   ├── Header.tsx           # Page title + live health badge
+│       │   ├── StatsCard.tsx        # Single metric card
+│       │   ├── EventTable.tsx       # Clickable event rows
+│       │   ├── EventChart.tsx       # Area, Pie, Bar charts (Recharts)
+│       │   ├── Filters.tsx          # Type + date range filters
+│       │   ├── Loading.tsx          # Spinner component
+│       │   └── StatusBadge.tsx      # Color-coded status indicator
+│       ├── pages/
+│       │   ├── Dashboard.tsx        # Stats + timeline + type dist + recent events
+│       │   ├── Events.tsx           # Filterable, paginated event list
+│       │   ├── EventDetail.tsx      # Single event metadata + JSON viewer
+│       │   ├── Analytics.tsx        # Configurable charts (6h–7d)
+│       │   └── DLQ.tsx              # DLQ envelope docs + roadmap
+│       ├── hooks/useApi.ts          # Generic data-fetching hook
+│       ├── services/api.ts          # Typed API client (fetch-based)
+│       ├── types/index.ts           # TypeScript interfaces
+│       ├── utils/formatters.ts      # Date/number formatters
+│       └── styles/index.css         # Dark-theme CSS (custom properties)
 ├── deploy/
 │   ├── docker/Dockerfile.ingestion  # (empty)
 │   └── k8s/                         # (all empty stubs)
 ├── desgin/                           # Architecture decision records
 ├── docker-compose.yml                # Kafka + ZooKeeper + PostgreSQL
 ├── go.mod
-└── README.md                         # (empty)
+└── README.md
 ```

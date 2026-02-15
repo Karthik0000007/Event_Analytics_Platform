@@ -36,17 +36,54 @@ Most event systems optimize for throughput. This one optimizes for **correctness
                     │  Event Consumer  │──────▶│  PostgreSQL  │
                     │  (consumer group)│       │  (idempotent │
                     └────────┬─────────┘       │   storage)   │
-                             │                 └──────────────┘
-                             │ poison pills /
-                             │ retries exhausted
-                             ▼
-                    ┌──────────────────┐
-                    │    DLQ Topic     │  Topic: events.dlq
-                    │  (full envelope) │  Preserves original message
-                    └──────────────────┘
+                             │                 └──────┬───────┘
+                             │ poison pills /         │ query
+                             │ retries exhausted      ▼
+                             ▼                ┌──────────────────┐
+                    ┌──────────────────┐      │  Frontend UI     │
+                    │    DLQ Topic     │      │  React + Vite    │
+                    │  (full envelope) │      │     :3000        │
+                    └──────────────────┘      └──────────────────┘
 ```
 
 > Full component breakdown, sequence diagrams, and dependency graphs: **[ARCHITECTURE.md](ARCHITECTURE.md)**
+
+---
+
+## Frontend
+
+A React 18 + TypeScript single-page application providing real-time visibility into the event pipeline.
+
+### Pages
+
+| Page | Route | Description |
+|---|---|---|
+| **Dashboard** | `/` | Summary stats, 24h event volume chart, type distribution pie, recent events |
+| **Events** | `/events` | Filterable, paginated event list (by type, date range) |
+| **Event Detail** | `/events/:id` | Full metadata + formatted JSON payload viewer |
+| **Analytics** | `/analytics` | Configurable timeline (6h–7d), pie chart, bar chart |
+| **Dead Letters** | `/dlq` | DLQ envelope format documentation + implementation roadmap |
+
+### API Endpoints (Read Layer)
+
+The backend exposes these additional GET endpoints consumed by the frontend:
+
+| Endpoint | Description |
+|---|---|
+| `GET /v1/events` | Paginated event list with `?type=`, `?from=`, `?to=`, `?limit=`, `?offset=` |
+| `GET /v1/events/{id}` | Single event by UUID |
+| `GET /v1/analytics/summary` | Total events, today's count, distinct types, top 5 types |
+| `GET /v1/analytics/types` | Event counts grouped by type |
+| `GET /v1/analytics/timeline?hours=24` | Hourly event counts for the given window |
+
+### Tech Stack
+
+- **React 18** with React Router v6
+- **Recharts** — Area, Pie, and Bar charts
+- **Lucide React** — Icon library
+- **date-fns** — Date formatting
+- **Vite** — Dev server with API proxy to `:8080`
+- Dark theme, responsive layout
 
 ---
 
@@ -81,6 +118,8 @@ If the DLQ write itself fails, the offset is **not committed** — the original 
 
 ## How To Run
 
+### Backend
+
 ```bash
 # 1. Start Kafka + PostgreSQL
 docker-compose up -d
@@ -104,6 +143,27 @@ curl -X POST http://localhost:8080/v1/events \
 go test -v ./internal/messaging/...
 ```
 
+### Frontend
+
+```bash
+# 1. Navigate to the frontend directory
+cd Event_Analytics_Platform/frontend
+
+# 2. Install dependencies
+npm install
+
+# 3. Start the development server (runs on http://localhost:3000)
+npm run dev
+
+# 4. Build for production
+npm run build
+
+# 5. Preview production build
+npm run preview
+```
+
+> The Vite dev server proxies all `/v1/*` API calls to the Go backend on `:8080`, so make sure the backend is running first.
+
 ---
 
 ## What I Would Improve in Production
@@ -125,11 +185,25 @@ go test -v ./internal/messaging/...
 cmd/ingestion_api/       → HTTP server binary
 cmd/event-consumer/      → Kafka consumer binary
 internal/messaging/      → Producer, Consumer, DLQ, retry, error classification
-internal/storage/        → PostgreSQL client (idempotent insert)
-internal/api/            → Router, handlers, middleware
+internal/storage/        → PostgreSQL client (idempotent insert + query layer)
+internal/api/            → Router, handlers (write + read), middleware
 internal/config/         → Environment-based configuration
 migrations/              → SQL schema (versioned)
 deploy/                  → Docker + Kubernetes manifests (WIP)
+
+Event_Analytics_Platform/frontend/
+  src/
+    components/          → Sidebar, Header, Layout, StatsCard, EventTable,
+                           EventChart (Area/Pie/Bar), Filters, Loading, StatusBadge
+    pages/               → Dashboard, Events, EventDetail, Analytics, DLQ
+    hooks/               → useApi (generic data-fetching hook)
+    services/            → API client (fetch-based, typed)
+    types/               → TypeScript interfaces for events, analytics, components
+    utils/               → Date/number formatters, JSON pretty-print
+    styles/              → Global dark-theme CSS
+  index.html             → Vite entry point
+  vite.config.ts         → Dev server + API proxy to :8080
+  package.json           → React 18, React Router 6, Recharts, Lucide, date-fns
 ```
 
 > **Deep dive →** [ARCHITECTURE.md](ARCHITECTURE.md) — full domain model, execution flow diagrams, security analysis, failure maps, and onboarding guide.
