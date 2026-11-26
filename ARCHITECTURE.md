@@ -1,805 +1,325 @@
-# Event Analytics Platform — Technical Documentation
+# Event Analytics Platform: Technical Notes
 
-> **Version:** 1.1  
-> **Last updated:** 2026-02-16  
-> **Language / Runtime:** Go 1.25 · Kafka (Confluent 7.5) · PostgreSQL 15 · React 18 + TypeScript  
-> **Architecture style:** Event-driven, two-service async pipeline with analytics frontend  
+> **Last updated:** 2026-11-26
+> **Stack:** Go 1.25 · Kafka (Confluent 7.5, single broker) · PostgreSQL 15 · React 18 + TypeScript + Vite · nginx
+> **Style:** event-driven pipeline of three small Go services plus a dashboard
 
----
+The [README](README.md) covers how to run it, the API, the guarantees and the failure demo.
+This file explains how the parts fit together and why.
 
 ## Table of Contents
 
-1. [System Overview](#1-system-overview)  
-2. [Architecture Breakdown](#2-architecture-breakdown)  
-3. [Domain Model](#3-domain-model)  
-4. [Execution Flow](#4-execution-flow)  
-5. [Key Design Decisions](#5-key-design-decisions)  
-6. [Failure & Edge Case Analysis](#6-failure--edge-case-analysis)  
-7. [Security Considerations](#7-security-considerations)  
-8. [Developer Onboarding Guide](#8-developer-onboarding-guide)  
-9. [Frontend Architecture](#9-frontend-architecture)  
-10. [Suggested Improvements](#10-suggested-improvements)  
+1. [System Overview](#1-system-overview)
+2. [Components](#2-components)
+3. [Data Model](#3-data-model)
+4. [Execution Flow](#4-execution-flow)
+5. [Key Design Decisions](#5-key-design-decisions)
+6. [Failure Analysis](#6-failure-analysis)
+7. [Security Considerations](#7-security-considerations)
+8. [Frontend](#8-frontend)
+9. [Known Limits and Next Steps](#9-known-limits-and-next-steps)
 
 ---
 
 ## 1. System Overview
 
-### Purpose
-
-The Event Analytics Platform is a **production-grade event ingestion and processing system** designed for marketplace-style applications. It accepts high-volume, bursty event traffic via a REST API, buffers events through Kafka, persists them durably into PostgreSQL with at-least-once delivery guarantees, and surfaces the data through a **React-based analytics dashboard**.
-
-The backend focuses on correctness, durability, operational safety, and debuggability under failure. The frontend provides real-time visibility into the event pipeline with interactive charts, paginated event browsing, and aggregated analytics.
-
-### High-Level Architecture
+The platform accepts events over HTTP, buffers them in Kafka and stores them in PostgreSQL with at-least-once delivery and idempotent writes. Messages that cannot be stored go to a dead-letter topic, are copied into Postgres, and are shown in the dashboard.
 
 ```mermaid
 flowchart LR
-    subgraph Producers
-        P1[HTTP Client]
-        P2[HTTP Client]
-    end
-
-    subgraph Ingestion
-        API[Ingestion API<br/>:8080]
-    end
-
-    subgraph Messaging
-        K[Kafka Cluster<br/>Topic: events]
-        DLQ[Kafka DLQ<br/>Topic: events.dlq]
-    end
-
-    subgraph Processing
-        C[Event Consumer<br/>consumer group]
-    end
-
-    subgraph Storage
-        PG[(PostgreSQL<br/>events table)]
-    end
-
-    subgraph Frontend
-        UI[React Dashboard<br/>:3000]
-    end
-
-    P1 -->|POST /v1/events| API
-    P2 -->|POST /v1/events| API
-    API -->|async publish| K
-    K -->|fetch + manual commit| C
-    C -->|INSERT idempotent| PG
-    C -->|poison pill /<br/>retries exhausted| DLQ
-    UI -->|GET /v1/events<br/>GET /v1/analytics/*| API
-    API -->|query| PG
+    Client["HTTP client"] -->|"POST /v1/events"| API["ingestion_api :8080"]
+    Web["web :3000 (nginx + React)"] -->|"proxy /v1, /healthz, /readyz"| API
+    API -->|"sync publish, acks=all"| K[("events topic, 3 partitions")]
+    K -->|"fetch + manual commit"| C["event-consumer"]
+    C -->|"INSERT ON CONFLICT DO NOTHING"| PG[("PostgreSQL")]
+    C -->|"poison pill / permanent / retries used up"| DLQ[("events.dlq topic")]
+    DLQ -->|"fetch + manual commit"| R["dlq-recorder"]
+    R -->|"INSERT dead_letters"| PG
+    API -->|"read queries"| PG
 ```
-
-### Core Responsibilities
 
 | Responsibility | Owner |
 |---|---|
-| Input validation & acceptance | Ingestion API |
-| Durable buffering & backpressure | Kafka |
-| Deserialization, persistence, correctness | Event Consumer |
-| Idempotent storage with conflict resolution | PostgreSQL |
-| Failed message isolation | DLQ (events.dlq topic) |
-| Event browsing, analytics visualization | Frontend Dashboard |
+| Input validation, accepting events | `ingestion_api` |
+| Durable buffer between API and database | Kafka topic `events` |
+| Decode, store, retry, pause on outage, dead-letter | `event-consumer` (`messaging.Processor`) |
+| Idempotent storage | PostgreSQL `events` table (primary key `event_id`) |
+| Failed message isolation | Kafka topic `events.dlq` |
+| Making dead letters queryable | `dlq-recorder` and the `dead_letters` table |
+| Browsing events, analytics, dead letters | `web` dashboard |
 
 ---
 
-## 2. Architecture Breakdown
+## 2. Components
 
-### Major Components
+### Ingestion API (`cmd/ingestion_api`)
 
-#### Ingestion API (`cmd/ingestion_api`)
+A chi HTTP server. On start it connects to Postgres, creates the Kafka producer, and serves until `SIGINT`/`SIGTERM`. Shutdown stops new connections, waits up to 10 seconds for in-flight requests, then closes the producer and the database pool.
 
-A stateless HTTP server built on [chi](https://github.com/go-chi/chi). Receives events via `POST /v1/events`, validates UUID format, and **asynchronously publishes** to Kafka before returning `202 Accepted`.
+`POST /v1/events` validation (`internal/api/handlers/event.go`):
 
-Key files:
-- `cmd/ingestion_api/main.go` — HTTP server bootstrap  
-- `internal/api/router.go` — Route registration (chi), CORS middleware  
-- `internal/api/handlers/event.go` — Event handler with validation (POST)  
-- `internal/api/handlers/query.go` — Query handlers for events & analytics (GET)  
-- `internal/api/middleware/request_id.go` — X-Request-ID propagation  
-- `internal/api/middleware/logging.go` — Request/response timing  
-
-#### Event Consumer (`cmd/event-consumer`)
-
-A long-running Kafka consumer that fetches messages, deserializes them, and writes to PostgreSQL. Implements full resilience:
-
-- **Poison pill detection** — invalid JSON or missing required fields routed directly to DLQ  
-- **Error classification** — each DB failure classified as transient or permanent  
-- **Bounded retry** — exponential back-off with jitter, hard ceiling  
-- **DLQ routing** — failed messages written to `events.dlq` with full forensic envelope  
-
-Key files:
-- `cmd/event-consumer/main.go` — Consumer loop + processMessage pipeline  
-- `internal/messaging/consumer.go` — Kafka reader with manual commit  
-- `internal/messaging/dlq.go` — DLQ producer + envelope format  
-- `internal/messaging/errors.go` — Error classification engine  
-- `internal/messaging/retry.go` — Exponential back-off + jitter  
-
-#### Messaging Layer (`internal/messaging`)
-
-| Component | Role |
+| Rule | Response |
 |---|---|
-| `Producer` | Writes events to `events` topic (used by Ingestion API) |
-| `Consumer` | Reads from `events` topic with manual offset commit |
-| `DLQProducer` | Writes failed messages to `events.dlq` topic |
-| `RetryConfig` | Bounded exponential back-off with jitter |
-| `Classify()` | Inspects errors → transient or permanent |
+| Body larger than 64 KB (`http.MaxBytesReader`) | `413` |
+| Not valid JSON, or more than one JSON value | `400` |
+| `event_id` missing or not a UUID | `400` |
+| `event_type` missing, blank, or longer than 64 characters | `400` |
+| `payload` missing or `null` | stored as `{}` |
+| Kafka write fails or takes more than 5 s | `503` |
+| Kafka acknowledged the write | `202` with `event_id` |
 
-All Kafka writers use `RequiredAcks: RequireAll` (ISR acknowledgment) and `LeastBytes` balancing.
+Middleware: `RequestID` (reads or creates `X-Request-ID`), `Logging` (one JSON line per request with method, path, status and duration), and a permissive CORS header for the Vite dev server.
 
-#### Storage Layer (`internal/storage`)
+### Event consumer (`cmd/event-consumer`)
 
-Thin wrapper over `database/sql` targeting PostgreSQL. Connection pool tuned to 25 open / 5 idle / 5-minute lifetime.
+A loop: `FetchMessage` then `Processor.Process`. Messages are handled one at a time, in order. The decision logic lives in `internal/messaging/processor.go`, behind three small interfaces (`EventStore`, `DeadLetterWriter`, `OffsetCommitter`), so the tests run the real code against fakes.
+
+### DLQ recorder (`cmd/dlq-recorder`)
+
+Reads `events.dlq` with its own consumer group (`dlq-recorder-group`). For each message it parses the DLQ envelope, cleans text that Postgres TEXT columns reject (invalid UTF-8 and NUL), inserts a row into `dead_letters`, and only then commits the offset. Transient insert errors are retried until they succeed. A permanent error is logged with the full message and skipped, because there is no further DLQ.
+
+### Messaging (`internal/messaging`)
+
+| Part | Role |
+|---|---|
+| `Producer` | Writes to `events`, `RequiredAcks: all`, hash balancer on the key |
+| `Consumer` | Reader with auto-commit off; a new group starts at the oldest offset |
+| `DLQProducer` | Writes the DLQ envelope to `events.dlq` |
+| `Processor` | Per-message rules: store, retry, pause, dead-letter, commit |
+| `RetryConfig` | Exponential backoff with jitter and a retry budget |
+| `Classify` | Transient or permanent, see section 6 |
+
+### Storage (`internal/storage`)
+
+A thin `database/sql` wrapper with `lib/pq`. Pool: 25 open, 5 idle, 5-minute lifetime.
 
 | Method | Purpose |
 |---|---|
-| `InsertEvent()` | Idempotent upsert via `ON CONFLICT (event_id) DO NOTHING` |
-| `GetEvents()` | Paginated, filterable event listing (type, date range) |
-| `GetEvent()` | Single event lookup by UUID |
-| `GetSummary()` | Aggregate stats: total, today, distinct types, top 5 |
-| `GetTypeCounts()` | Event counts grouped by `event_type` |
-| `GetTimeline()` | Hourly event counts for a configurable window |
+| `InsertEvent` | `INSERT ... ON CONFLICT (event_id) DO NOTHING` |
+| `GetEvents`, `GetEvent` | Paged and filtered event reads |
+| `GetSummary`, `GetTypeCounts`, `GetTimeline` | Analytics |
+| `InsertDeadLetter`, `ListDeadLetters` | Dead letters (idempotent on partition and offset) |
+| `Ping` | Readiness and outage detection |
 
-#### Configuration (`internal/config`)
+### Infrastructure (`docker-compose.yml`)
 
-All configuration sourced from environment variables with sensible defaults. No config files, no feature flags. Flat struct, fully enumerable.
+`zookeeper` and `kafka` (with healthchecks), `kafka-init` (creates `events` with 3 partitions and `events.dlq` with 1, then exits), `postgres` (healthcheck with `pg_isready`), `migrate` (golang-migrate applies `migrations/`, then exits), then `api`, `consumer`, `dlq-recorder` and `web`. Containers talk to `kafka:29092` and `postgres:5432`. Kafka auto topic creation is off. All Go services share one multi-stage `Dockerfile` with a `SERVICE` build arg and run as a non-root user.
 
-### Dependency Relationships
+### Dependencies between packages
 
 ```mermaid
 graph TD
-    CMD_API[cmd/ingestion_api] --> API[internal/api]
-    CMD_API --> CFG[internal/config]
-    CMD_API --> LOG[internal/logging]
-
-    API --> HANDLERS[internal/api/handlers]
-    API --> HEALTH[internal/health]
-    HANDLERS --> MSG[internal/messaging]
-    HANDLERS --> STORE[internal/storage]
-
-    CMD_CON[cmd/event-consumer] --> CFG
-    CMD_CON --> LOG
-    CMD_CON --> MSG
-    CMD_CON --> STORE
-
-    FRONTEND[Frontend SPA] -->|HTTP fetch| API
-
-    MSG --> KAFKA_GO[segmentio/kafka-go]
-    STORE --> LIB_PQ[lib/pq]
-
-    style CMD_API fill:#4a9eff,color:#fff
-    style CMD_CON fill:#4a9eff,color:#fff
-    style MSG fill:#ff9f43,color:#fff
-    style STORE fill:#2ecc71,color:#fff
-    style FRONTEND fill:#6366f1,color:#fff
+    API_CMD["cmd/ingestion_api"] --> API["internal/api"]
+    API --> HANDLERS["internal/api/handlers"]
+    API --> HEALTH["internal/health"]
+    HANDLERS --> STORE["internal/storage"]
+    API_CMD --> MSG["internal/messaging"]
+    CON_CMD["cmd/event-consumer"] --> MSG
+    CON_CMD --> STORE
+    REC_CMD["cmd/dlq-recorder"] --> MSG
+    REC_CMD --> STORE
+    MSG --> LOG["internal/logging"]
+    MSG --> KAFKA_GO["segmentio/kafka-go"]
+    STORE --> LIB_PQ["lib/pq"]
 ```
 
-### External Integrations
-
-| System | Protocol | Purpose |
-|---|---|---|
-| Apache Kafka | TCP (Kafka protocol) | Event buffering, DLQ |
-| PostgreSQL 15 | TCP (libpq) | Durable event storage |
-| ZooKeeper | TCP | Kafka coordination (Confluent 7.5 dependency) |
+`handlers` does not import `messaging`: it depends on a one-method `Publisher` interface, which `*messaging.Producer` satisfies.
 
 ---
 
-## 3. Domain Model
+## 3. Data Model
 
-### Key Entities
+### Event (API body and Kafka value)
 
-#### Event (API Request)
-
-```go
-type EventRequest struct {
-    EventID string          `json:"event_id"`  // UUID, client-generated
-    Type    string          `json:"event_type"` // e.g. "click", "purchase"
-    Payload json.RawMessage `json:"payload"`    // opaque JSON blob
-}
+```json
+{"event_id": "550e8400-e29b-41d4-a716-446655440000", "event_type": "click", "payload": {"page": "/home"}}
 ```
 
-#### Event (Database Row)
+Kafka key: `event_id`. Value: the JSON above.
+
+### Tables
 
 ```sql
+-- migrations/000001
 CREATE TABLE events (
     event_id    UUID PRIMARY KEY,
     event_type  VARCHAR(255) NOT NULL,
     payload     JSONB NOT NULL DEFAULT '{}',
     received_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- migrations/000002
+CREATE TABLE dead_letters (
+    id              BIGSERIAL PRIMARY KEY,
+    original_key    TEXT NOT NULL DEFAULT '',
+    original_value  TEXT NOT NULL DEFAULT '',  -- TEXT, not JSONB: poison pills are not valid JSON
+    error_kind      VARCHAR(32) NOT NULL,      -- transient | permanent | unknown
+    error_message   TEXT NOT NULL DEFAULT '',
+    retry_count     INT NOT NULL DEFAULT 0,
+    failed_at       TIMESTAMPTZ NOT NULL,
+    kafka_partition INT NOT NULL,              -- position in events.dlq
+    kafka_offset    BIGINT NOT NULL,
+    recorded_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (kafka_partition, kafka_offset)
+);
 ```
 
-#### DLQ Envelope
+### DLQ envelope (value on `events.dlq`)
 
 ```go
 type DLQMessage struct {
-    OriginalTopic     string          `json:"original_topic"`
-    OriginalPartition int             `json:"original_partition"`
-    OriginalOffset    int64           `json:"original_offset"`
-    OriginalKey       string          `json:"original_key"`
-    OriginalValue     json.RawMessage `json:"original_value"`
-    ErrorMessage      string          `json:"error_message"`
-    ErrorKind         string          `json:"error_kind"`   // "transient" | "permanent"
-    Retries           int             `json:"retries"`
-    FailedAt          time.Time       `json:"failed_at"`
+    OriginalTopic     string    `json:"original_topic"`
+    OriginalPartition int       `json:"original_partition"`
+    OriginalOffset    int64     `json:"original_offset"`
+    OriginalKey       string    `json:"original_key"`
+    OriginalValue     string    `json:"original_value"` // raw bytes as text
+    ErrorMessage      string    `json:"error_message"`
+    ErrorKind         string    `json:"error_kind"`
+    Retries           int       `json:"retries"`
+    FailedAt          time.Time `json:"failed_at"`
 }
 ```
 
-### Data Transformations
+`OriginalValue` is a string on purpose. As `json.RawMessage`, an invalid-JSON message could not be marshalled, so poison pills could never reach the DLQ.
 
-| Stage | Transformation |
-|---|---|
-| API ingestion | JSON body → `EventRequest` struct → re-serialized as Kafka message value |
-| Kafka transport | Bytes on wire; key = `event_id`, value = JSON |
-| Consumer | Kafka message → `event` struct → PostgreSQL `INSERT` with `event_id`, `event_type`, `payload` |
-| DLQ routing | Original Kafka message → wrapped in `DLQMessage` envelope with failure metadata |
+### Invariants
 
-### Important Invariants
-
-1. **`event_id` is globally unique and client-generated.** The entire idempotency model relies on clients generating UUIDs. Duplicate IDs result in `DO NOTHING`, not upserts.
-2. **An event is "accepted" when Kafka acknowledges it**, not when it reaches the database. The API returns `202 Accepted` after a successful Kafka write.
-3. **Offsets are committed only after a successful DB write** (or after DLQ routing). This guarantees at-least-once delivery — no silent drops.
-4. **Payload is opaque.** The system never inspects `payload` contents. Schema validation is the producer's responsibility.
-5. **Append-only storage.** Events are never updated or deleted through the application layer.
+1. `event_id` is unique and chosen by the client. Idempotency depends on it.
+2. An event is accepted when Kafka acknowledges it, not when it reaches Postgres.
+3. An offset is committed only after the event is in Postgres or in `events.dlq`.
+4. The payload is opaque. Only Postgres can reject it (for example `\u0000`, which JSONB cannot store).
 
 ---
 
 ## 4. Execution Flow
 
-### Event Lifecycle (End-to-End)
-
 ```mermaid
 sequenceDiagram
     participant Client
-    participant API as Ingestion API
+    participant API as ingestion_api
     participant Kafka
-    participant Consumer as Event Consumer
+    participant Consumer as event-consumer
     participant DB as PostgreSQL
-    participant DLQ as DLQ Topic
+    participant DLQ as events.dlq
+    participant Rec as dlq-recorder
 
-    Client->>API: POST /v1/events {event_id, event_type, payload}
-    API->>API: Validate JSON + UUID format
-    API-->>Client: 202 Accepted {status, event_id}
-    API-)Kafka: Async publish (goroutine)
+    Client->>API: POST /v1/events
+    API->>API: validate (size, JSON, UUID, event_type)
+    API->>Kafka: publish and wait for ack
+    API-->>Client: 202 Accepted (or 503 if Kafka failed)
 
-    loop Consume Loop
-        Kafka->>Consumer: FetchMessage (manual commit)
-        Consumer->>Consumer: Unmarshal JSON
-        alt Poison Pill (bad JSON / missing fields)
-            Consumer->>DLQ: Send with permanent classification
-            Consumer->>Kafka: Commit offset
-        else Valid Event
-            loop Bounded Retry (max 5)
-                Consumer->>DB: INSERT ... ON CONFLICT DO NOTHING
-                alt Success
-                    Consumer->>Kafka: Commit offset
-                else Transient Error
-                    Consumer->>Consumer: Backoff (exponential + jitter)
-                else Permanent Error
-                    Consumer->>DLQ: Send with permanent classification
-                    Consumer->>Kafka: Commit offset
-                end
+    Kafka->>Consumer: FetchMessage
+    alt invalid JSON or missing fields
+        Consumer->>DLQ: send (permanent, 0 retries)
+        Consumer->>Kafka: commit
+    else valid event
+        loop until stored, dead-lettered or shut down
+            Consumer->>DB: INSERT ON CONFLICT DO NOTHING
+            alt success
+                Consumer->>Kafka: commit
+            else permanent error
+                Consumer->>DLQ: send
+                Consumer->>Kafka: commit
+            else transient, budget left
+                Consumer->>Consumer: backoff with jitter
+            else transient, budget used up, ping fails
+                Consumer->>DB: ping every 2 s until it answers
+                Note over Consumer: fresh retry budget, same message
+            else transient, budget used up, ping works
+                Consumer->>DLQ: send (transient)
+                Consumer->>Kafka: commit
             end
-            Note over Consumer,DLQ: If transient retries exhausted → DLQ
         end
     end
+
+    DLQ->>Rec: FetchMessage
+    Rec->>DB: INSERT dead_letters (retry until it works)
+    Rec->>Kafka: commit
 ```
 
-### Request Lifecycle (Ingestion API)
-
-1. HTTP request arrives at `POST /v1/events`
-2. `RequestID` middleware assigns/propagates `X-Request-ID`
-3. `Logging` middleware records start time
-4. `HandleEvent` handler:
-   - Decodes JSON body
-   - Validates `event_id` as UUID
-   - Spawns goroutine to publish to Kafka (5s timeout)
-   - Returns `202 Accepted` immediately
-5. Logging middleware records response duration
-
-### Message Processing Lifecycle (Consumer)
-
-1. `FetchMessage` blocks until a message is available (or context cancelled)
-2. **Poison pill check #1:** JSON unmarshal — invalid → DLQ + commit
-3. **Poison pill check #2:** Required fields (`event_id`, `event_type`) — missing → DLQ + commit
-4. **Retry loop (attempt 0..MaxRetries-1):**
-   - `InsertEvent` with 5s timeout
-   - Success → commit offset → log → done
-   - Error → `Classify()`:
-     - Permanent → DLQ + commit → done
-     - Transient + budget remaining → `Sleep()` with backoff → next attempt
-     - Transient + budget exhausted → DLQ + commit → done
-5. Shutdown: context cancellation during sleep exits cleanly without committing
+A failed DLQ send is retried with backoff and the offset is not committed until it succeeds. On shutdown, any wait (backoff, outage pause, DLQ retry) returns at once without a commit.
 
 ---
 
 ## 5. Key Design Decisions
 
-### Why This Structure Exists
+| Decision | Why | Cost |
+|---|---|---|
+| Synchronous publish in the API | `202` means Kafka has the event, so a crash cannot lose it | Each request waits for the Kafka ack (a few ms locally) |
+| Manual offset commit after the write | A crash causes a replay, not a loss | Duplicates are possible, so writes must be idempotent |
+| `ON CONFLICT DO NOTHING` on `event_id` | Replays are harmless | Clients must send unique UUIDs |
+| Pause on outage instead of dead-lettering | An outage is not the message's fault, and the DLQ should hold only bad messages | One partition waits while the database is down |
+| DLQ through Kafka, recorded by a separate service | Postgres may be the thing that is down when the consumer dead-letters | One more small service |
+| SQLSTATE-based classification | Codes are stable, error text is not | Errors without a code still fall back to text matching |
+| Hash balancer, 3 partitions | Same key, same partition, so one event is handled in order; up to 3 consumers can share the load | Ordering holds only within a partition |
+| Liveness separate from readiness | A database outage should not restart the API | `/readyz` returns 503 during the outage while ingestion still works |
 
-The codebase follows Go's **standard project layout** (`cmd/`, `internal/`, `pkg/`) with a clear separation between two independently deployable binaries — the API and the consumer. This is not a monolith; it's a **two-service async pipeline** sharing internal libraries via `internal/`.
+**Scaling.** The API is stateless and can run as many copies as needed. Consumers scale inside the consumer group up to the partition count (`docker compose up -d --scale consumer=3` was tested and shares the work). Postgres is the eventual bottleneck: there are no replicas or table partitioning.
 
-The `internal/` boundary enforces that no external package can import these modules, keeping the API surface minimal and the blast radius of changes contained.
-
-### Trade-offs Visible in the Implementation
-
-| Decision | Trade-off |
-|---|---|
-| **Async publish in goroutine** | API returns fast (`202`) but Kafka write failures are invisible to the caller. A crash between response and publish loses the event. |
-| **At-least-once delivery** | Duplicate processing is possible. Mitigated by `ON CONFLICT DO NOTHING` but requires client-generated unique IDs. |
-| **`json.RawMessage` for payload** | No schema validation on payload contents. Fast and flexible, but allows garbage in. |
-| **Manual offset commit** | Guarantees no silent drops but increases complexity. A consumer crash mid-processing replays the message. |
-| **String-based error classification** | `Classify()` uses `strings.Contains` on error messages. Fragile if postgres driver changes error wording; but practical and effective. |
-| **Single consumer group** | Simplicity. Scaling requires adding consumers to the group, not changing code. |
-
-### Scalability Considerations
-
-- **Ingestion API** is stateless — scale horizontally behind a load balancer.
-- **Consumer** scales within a Kafka consumer group (one consumer per partition).
-- **PostgreSQL** is the bottleneck at scale. Connection pool is capped at 25. No read replicas, no sharding, no partitioning.
-- **Kafka** runs single-broker with replication factor 1 in dev. Production would need multi-broker with RF ≥ 3.
-
-### Observability Patterns
-
-| Pattern | Implementation |
-|---|---|
-| **Structured logging** | Custom `Logger` emitting `map[string]any` with `level`, `service`, `message` fields |
-| **Request tracing** | `X-Request-ID` header propagated via context |
-| **Health checks** | `/healthz` (liveness) and `/readyz` (readiness) endpoints |
-| **Error classification** | Every consumer failure tagged `transient` or `permanent` in logs |
-| **DLQ forensics** | Full original message + failure metadata preserved in DLQ envelope |
-
-**Not yet implemented:** Prometheus metrics, distributed tracing (OpenTelemetry), log-level filtering.
+**Observability.** JSON log lines with `time`, `level`, `service` and `message`; request IDs through `X-Request-ID`; error kind on every failure log; the DLQ envelope keeps the original message. There are no metrics or tracing yet.
 
 ---
 
-## 6. Failure & Edge Case Analysis
+## 6. Failure Analysis
 
-### Where Failures May Occur
+| Failure | What the system does | Visible as |
+|---|---|---|
+| Invalid request | `400`/`413`, nothing published | JSON error to the client |
+| Kafka down when the API publishes | `503`, nothing accepted | Client retries |
+| Invalid JSON or missing fields in Kafka | DLQ at once, commit | Dead Letters page, `error_kind: permanent` |
+| Postgres rejects the value (SQLSTATE 22, 23) | DLQ after 1 attempt, commit | Dead Letters page |
+| Postgres down for a short time | Retries with backoff, then stores | `insert failed` logs, then `event persisted` |
+| Postgres down for longer than the retry budget | Pauses, pings every 2 s, then stores | `database unreachable, pausing...` and `database is back, resuming` |
+| Repeated transient error while Postgres is healthy | DLQ with `error_kind: transient` | Dead Letters page |
+| DLQ write fails | Retry with backoff, no commit | `DLQ write failed, retrying` logs |
+| Consumer crash before commit | Message delivered again, insert is a no-op if it was stored | Nothing lost, no duplicate row |
+| Postgres down for the recorder | Retries until it works, no commit | Dead letters appear once Postgres is back |
 
-```mermaid
-flowchart TD
-    A[Client sends event] -->|network failure| B[API unreachable]
-    A --> C[API receives request]
-    C -->|invalid JSON| D[400 Bad Request]
-    C -->|invalid UUID| E[400 Bad Request]
-    C --> F[202 Accepted returned]
-    F -->|goroutine Kafka publish| G{Kafka available?}
-    G -->|No| H[⚠ Silent event loss]
-    G -->|Yes| I[Message in Kafka]
-    I --> J[Consumer fetches]
-    J -->|bad JSON| K[Poison pill → DLQ]
-    J -->|missing fields| L[Poison pill → DLQ]
-    J --> M[INSERT to PostgreSQL]
-    M -->|connection timeout| N[Transient → retry with backoff]
-    M -->|constraint violation| O[Permanent → DLQ]
-    M -->|success| P[Commit offset]
-    N -->|budget exhausted| Q[DLQ]
-    Q -->|DLQ write fails| R[⚠ CRITICAL: logged but message stuck]
-
-    style H fill:#e74c3c,color:#fff
-    style R fill:#e74c3c,color:#fff
-```
-
-### Error Handling Strategy
-
-| Layer | Strategy |
-|---|---|
-| **API** | Synchronous validation → 400/202 response codes. Kafka publish errors are logged but not surfaced to caller. |
-| **Consumer: Poison pills** | Invalid JSON or missing required fields → permanent DLQ → commit → move on |
-| **Consumer: DB transient** | Bounded retry (5 attempts, 200ms→10s backoff) → DLQ on exhaustion |
-| **Consumer: DB permanent** | No retry → immediate DLQ |
-| **Consumer: DLQ write failure** | Logged at CRITICAL level. Offset not committed — message will be replayed. |
-| **Shutdown** | SIGINT/SIGTERM → context cancellation. In-flight retries abort cleanly without committing (safe for replay). |
-
-### Error Classification Rules
-
-```
-Transient (retryable):
-  - net.Error (any network error)
-  - io.EOF / io.ErrUnexpectedEOF
-  - syscall.ECONNREFUSED / ECONNRESET
-  - Error messages containing: "connection refused", "connection reset", "timeout", "too many clients"
-  - Unknown errors (default-to-transient policy)
-
-Permanent (non-retryable):
-  - Explicit ProcessingError{Kind: ErrPermanent}
-  - Error messages containing: "unique constraint", "violates check constraint", "invalid input syntax"
-```
-
-### Potential Technical Debt
-
-1. **Silent event loss on API's async publish.** The goroutine publish in `HandleEvent` has no feedback loop. If Kafka is down, events accepted via `202` are lost. This is the largest correctness risk in the system.
-2. **String-based error matching in `Classify()`.** Depends on error message text from `lib/pq`. A driver upgrade could change wording and cause misclassification.
-3. **Empty stub files.** `ratelimit.go`, `apikey.go`, `validation/even.go` are empty — they compile to valid (empty) packages but represent incomplete features.
-4. **Router does not wire middleware or producer.** `NewRouter()` does not use `Logging`, `RequestID` middleware, and `HandleEvent` expects a `*Producer` argument but the router calls it without one (compilation error in `internal/api`).
-5. **No consumer-side health probe.** The consumer binary has no `/healthz` or `/readyz` endpoint for Kubernetes liveness checks. Kubernetes cannot distinguish a stuck consumer from a healthy one.
+Classification order in `Classify`: explicit `ProcessingError`, then SQLSTATE code (class `22` and `23` permanent, all other codes transient), then network and I/O errors (transient), then known text for errors without a code, then unknown (transient).
 
 ---
 
 ## 7. Security Considerations
 
-### Input Validation
-
-| Check | Implementation | Gap |
-|---|---|---|
-| JSON structure | `json.Decoder` in handler | No max body size limit — potential OOM on large payloads |
-| `event_id` format | `uuid.Parse()` | Correct. Rejects non-UUID values. |
-| `event_type` presence | **Checked in consumer only** | Not checked in API handler — invalid events reach Kafka |
-| `payload` contents | None (opaque `json.RawMessage`) | By design; but allows arbitrarily large/nested JSON |
-
-### Authentication / Authorization
-
-- **Not implemented.** `internal/auth/apikey.go` exists but is empty.
-- The API accepts unauthenticated requests on all endpoints.
-- No rate limiting is implemented (`ratelimit.go` is empty).
-
-### Data Exposure Risks
-
-| Risk | Severity | Status |
-|---|---|---|
-| Database credentials in env vars with defaults in source | Medium | Dev defaults hardcoded in `config.go` |
-| No TLS between services (Kafka PLAINTEXT, Postgres sslmode=disable) | High | Expected for local dev; must change for production |
-| DLQ contains full original message payloads | Low | By design for forensics, but may contain PII |
-| No audit logging of who submitted events | Medium | No auth = no attribution |
-
----
-
-## 8. Developer Onboarding Guide
-
-### Prerequisites
-
-- Go 1.25+
-- Docker & Docker Compose
-- `psql` client (optional, for manual DB inspection)
-
-### Running Locally
-
-**1. Start infrastructure:**
-
-```bash
-docker-compose up -d
-```
-
-This starts ZooKeeper (port 2181), Kafka (port 9093), and PostgreSQL (port 5432).
-
-**2. Apply database migrations:**
-
-```powershell
-Get-Content migrations/000001_create_events_table.up.sql | docker-compose exec -T postgres psql -U events_user -d events_db
-```
-
-Or on Linux/Mac:
-```bash
-cat migrations/000001_create_events_table.up.sql | docker-compose exec -T postgres psql -U events_user -d events_db
-```
-
-**3. Build and run the Ingestion API:**
-
-```bash
-go build -o ingestion_api.exe ./cmd/ingestion_api
-./ingestion_api.exe
-```
-
-**4. Build and run the Event Consumer:**
-
-```bash
-go build -o event_consumer.exe ./cmd/event-consumer
-./event_consumer.exe
-```
-
-**5. Send a test event:**
-
-```bash
-curl -X POST http://localhost:8080/v1/events \
-  -H "Content-Type: application/json" \
-  -d '{"event_id":"550e8400-e29b-41d4-a716-446655440000","event_type":"click","payload":{"page":"/home"}}'
-```
-
-**6. Start the frontend:**
-
-```bash
-cd Event_Analytics_Platform/frontend
-npm install
-npm run dev
-```
-
-The dashboard opens at http://localhost:3000. The Vite dev server proxies all `/v1/*` API calls to the Go backend on `:8080`.
-
-### Environment Variables
-
-| Variable | Default | Used By | Description |
-|---|---|---|---|
-| `SERVICE_NAME` | `ingestion-api` | Both | Service identifier in logs |
-| `PORT` | `8080` | API | HTTP listen port |
-| `LOG_LEVEL` | `info` | Both | Log verbosity |
-| `KAFKA_BROKERS` | `localhost:9093` | Both | Comma-separated broker list |
-| `KAFKA_TOPIC` | `events` | Both | Primary event topic |
-| `KAFKA_GROUP_ID` | `event-consumer-group` | Consumer | Consumer group ID |
-| `KAFKA_DLQ_TOPIC` | `events.dlq` | Consumer | Dead-letter topic |
-| `MAX_RETRIES` | `5` | Consumer | Max retry attempts for transient failures |
-| `DB_USER` | `events_user` | Consumer | PostgreSQL username |
-| `DB_PASSWORD` | `events_password` | Consumer | PostgreSQL password |
-| `DB_HOST` | `localhost` | Consumer | PostgreSQL host |
-| `DB_PORT` | `5432` | Consumer | PostgreSQL port |
-| `DB_NAME` | `events_db` | Consumer | PostgreSQL database |
-
-### How to Add a New Feature Correctly
-
-**Adding a new event processing step (e.g. enrichment before DB write):**
-
-1. Add the logic in `cmd/event-consumer/main.go` inside `processMessage()`, between poison pill checks and the DB insert loop.
-2. If the new step can fail, classify the error using `messaging.Classify()` and follow the same retry/DLQ pattern.
-3. Add unit tests in `internal/messaging/failure_injection_test.go` simulating the new failure mode.
-
-**Adding a new API endpoint:**
-
-1. Create a handler function in `internal/api/handlers/`.
-2. Register the route in `internal/api/router.go` under the `/v1` group.
-3. Wire any middleware in the router (currently not done for existing middleware).
-
-**Adding a new Kafka topic:**
-
-1. Add the topic name as a config field in `internal/config/config.go`.
-2. Create a new `Producer` or `Consumer` instance in the relevant `cmd/` main.
-3. Kafka auto-creates topics by default in dev; for production, pre-create topics with proper partition/replication config.
-
-### Running Tests
-
-```bash
-go test -v ./internal/messaging/...
-```
-
-The test suite includes 27 tests covering:
-- Error classification (network, postgres, unknown errors)
-- Retry discipline (budget, backoff, jitter, context cancellation)
-- DLQ envelope serialization
-- 8 failure injection scenarios (poison pills, transient recovery, budget exhaustion, permanent failures, zero-retry config)
-
----
-
-## 9. Frontend Architecture
-
-### Overview
-
-The frontend is a **single-page application** built with React 18 and TypeScript, bundled by Vite. It connects to the Ingestion API's read endpoints to provide real-time event browsing, analytics dashboards, and system health monitoring.
-
-### Tech Stack
-
-| Technology | Purpose |
+| Area | Status |
 |---|---|
-| **React 18** | UI framework with functional components and hooks |
-| **React Router v6** | Client-side routing with nested layout routes |
-| **Recharts** | Charting library (Area, Pie, Bar charts) |
-| **Lucide React** | Icon library |
-| **date-fns** | Date formatting and relative time |
-| **TypeScript** | Static type safety across all components |
-| **Vite** | Dev server with HMR + API proxy to Go backend |
-
-### Page Architecture
-
-```mermaid
-graph TD
-    BrowserRouter --> Layout
-
-    Layout --> Sidebar
-    Layout --> Header
-    Layout --> Outlet
-
-    Outlet --> Dashboard["/ Dashboard"]
-    Outlet --> Events["/events Events"]
-    Outlet --> EventDetail["/events/:id EventDetail"]
-    Outlet --> Analytics["/analytics Analytics"]
-    Outlet --> DLQ["/dlq Dead Letters"]
-
-    Dashboard --> StatsCard
-    Dashboard --> TimelineChart
-    Dashboard --> TypePieChart
-    Dashboard --> EventTable
-
-    Events --> Filters
-    Events --> EventTable2[EventTable]
-
-    Analytics --> TimelineChart2[TimelineChart]
-    Analytics --> TypePieChart2[TypePieChart]
-    Analytics --> TypeBarChart
-
-    style Layout fill:#6366f1,color:#fff
-    style Dashboard fill:#22d3ee,color:#000
-    style Events fill:#22d3ee,color:#000
-    style Analytics fill:#22d3ee,color:#000
-```
-
-### API Integration
-
-The frontend uses a custom `useApi` hook for data fetching with automatic loading/error state management. All API calls go through fetch-based typed service functions.
-
-| Frontend Page | Backend Endpoint | Data |
-|---|---|---|
-| Dashboard | `GET /v1/analytics/summary` | Total events, today count, distinct types |
-| Dashboard | `GET /v1/analytics/timeline?hours=24` | Event volume chart data |
-| Dashboard | `GET /v1/analytics/types` | Type distribution for pie chart |
-| Dashboard | `GET /v1/events?limit=10` | Recent events table |
-| Events | `GET /v1/events?type=&from=&to=&limit=&offset=` | Paginated, filtered event list |
-| Event Detail | `GET /v1/events/{id}` | Single event with full payload |
-| Analytics | `GET /v1/analytics/summary` | Summary statistics |
-| Analytics | `GET /v1/analytics/timeline?hours=N` | Configurable timeline (6h–7d) |
-| Analytics | `GET /v1/analytics/types` | Type distribution (pie + bar) |
-| All pages | `GET /healthz` | Backend health status in header |
-
-### Component Hierarchy
-
-| Component | Type | Responsibility |
-|---|---|---|
-| `Layout` | Layout | Sidebar + Header + routed content via `<Outlet>` |
-| `Sidebar` | Navigation | App navigation with active route highlighting |
-| `Header` | Chrome | Page title + live health badge (polls every 30s) |
-| `StatsCard` | Data display | Single metric with icon, value, and optional trend |
-| `EventTable` | Data display | Clickable event rows with type badges, truncated payloads |
-| `EventChart` | Visualization | Timeline (Area), type distribution (Pie), type counts (Bar) |
-| `Filters` | Input | Type select, date range pickers, search/clear actions |
-| `Loading` | Feedback | Spinner with configurable message |
-| `StatusBadge` | Feedback | Color-coded status indicator |
-
-### Dev Server Proxy
-
-Vite proxies API requests to the Go backend during development:
-
-```typescript
-// vite.config.ts
-server: {
-  port: 3000,
-  proxy: {
-    '/v1':      { target: 'http://localhost:8080' },
-    '/healthz': { target: 'http://localhost:8080' },
-    '/readyz':  { target: 'http://localhost:8080' },
-  }
-}
-```
-
-This means the frontend dev server runs on `:3000` and all `/v1/*` requests are forwarded to the Go API on `:8080`, avoiding CORS issues during development.
-
-### Styling
-
-The frontend uses a CSS custom properties-based dark theme with no CSS framework:
-
-| Variable | Value | Purpose |
-|---|---|---|
-| `--bg` | `#0f1117` | Page background |
-| `--surface` | `#1a1d27` | Card/sidebar background |
-| `--accent` | `#6366f1` | Primary accent (indigo) |
-| `--text` | `#e4e5e9` | Primary text |
-| `--text-dim` | `#8b8d97` | Secondary text |
-
-The layout is responsive — the sidebar collapses on screens below 768px.
+| Body size | Limited to 64 KB |
+| `event_id` / `event_type` | Validated (UUID, 1 to 64 characters) |
+| Payload | Any JSON, not inspected |
+| SQL | Parameterized queries only; paging values are clamped and passed as parameters |
+| Authentication, rate limiting | **Not implemented.** The API is open |
+| CORS | `Access-Control-Allow-Origin: *`, meant for local development |
+| Transport | No TLS (Kafka PLAINTEXT, Postgres `sslmode=disable`). Local only |
+| Secrets | Development credentials are in `docker-compose.yml` and as defaults in `config.go` |
+| Containers | Go services run as a non-root user in Alpine images |
+| Data in the DLQ | Original payloads are kept and may contain personal data |
 
 ---
 
-## 10. Suggested Improvements
+## 8. Frontend
 
-### Critical (Correctness)
+React 18 + TypeScript, built by Vite, in `web/`. In Docker, nginx serves `dist/` and proxies `/v1`, `/healthz` and `/readyz` to `api:8080`, so the browser talks to one origin. In development, the Vite server on port 3000 proxies the same paths to `localhost:8080`.
 
-| Issue | Risk | Fix |
+| Page | Route | Data |
 |---|---|---|
-| **Async goroutine publish loses events** | Events vanish if Kafka is down after `202 Accepted` | Publish synchronously before returning 202, or use a local WAL (write-ahead log) for crash recovery |
-| **Router doesn't wire producer or middleware** | API handler panics at runtime (`HandleEvent` needs `*Producer`) | Fix `NewRouter()` to accept dependencies and register middleware |
-| **No request body size limit** | OOM on large malicious payloads | Add `http.MaxBytesReader` in handler or middleware |
+| Dashboard | `/` | `GET /v1/analytics/summary`, `/timeline?hours=24`, `/types`, `/v1/events?limit=10` |
+| Events | `/events` | `GET /v1/events` with filters and paging; **Send test event** and **Send bad event** buttons (`POST /v1/events`) with a toast |
+| Event detail | `/events/:id` | `GET /v1/events/{id}` |
+| Analytics | `/analytics` | Timeline (6 h to 7 d), pie and bar charts |
+| Dead Letters | `/dlq` | `GET /v1/dlq` with paging, empty state, refresh every 3 s, click a row to see the original message |
 
-### High (Reliability)
-
-| Issue | Risk | Fix |
-|---|---|---|
-| **No consumer health endpoint** | Kubernetes cannot detect stuck consumers | Add an HTTP health server in the consumer binary |
-| **No authentication** | Open API accepting traffic from anyone | Implement API key middleware (`apikey.go` is stubbed) |
-| **No rate limiting** | Single client can overwhelm the pipeline | Implement token bucket rate limiter (`ratelimit.go` is stubbed) |
-| **String-based error classification** | Driver update breaks classification | Use Postgres error codes (`pq.Error.Code`) instead of string matching |
-
-### Medium (Operational)
-
-| Issue | Risk | Fix |
-|---|---|---|
-| **No Prometheus metrics** | Blind to throughput, latency, error rates | Add `promhttp` handler + counters for events ingested, published, persisted, DLQ'd |
-| **No distributed tracing** | Cannot trace event from API to DB | Add OpenTelemetry spans across API → Kafka → Consumer → DB |
-| **Logger outputs Go maps** | Not parseable by log aggregators | Switch to JSON-structured logging (e.g. `slog`, `zerolog`) |
-| **No migration framework** | Manual SQL execution | Integrate `golang-migrate` or `goose` for versioned migrations |
-| **K8s manifests are empty** | Cannot actually deploy to Kubernetes | Populate deployment specs, resource limits, probes, and ConfigMaps |
-
-### Low (Code Quality)
-
-| Issue | Impact | Fix |
-|---|---|---|
-| **Empty stub files** (`ratelimit.go`, `apikey.go`, `even.go`) | Build warnings, confusion | Either implement or remove |
-| **Typo in directory name** | `desgin/` instead of `design/` | Rename directory |
-| **No `Dockerfile`** | `Dockerfile.ingestion` is empty | Add multi-stage Go build Dockerfile |
-| **`event_type` not validated at API layer** | Invalid types pass through to Kafka | Add validation with allowlist or regex in handler |
-
-### Architecture Evolution Path
-
-```mermaid
-graph LR
-    A[Current:<br/>2-service pipeline<br/>+ analytics frontend] --> B[Add metrics<br/>+ tracing]
-    B --> C[Add auth<br/>+ rate limiting]
-    C --> D[Schema registry<br/>for payload validation]
-    D --> E[DLQ consumer<br/>for replay/alerting]
-
-    style A fill:#3498db,color:#fff
-    style B fill:#e67e22,color:#fff
-    style C fill:#e67e22,color:#fff
-    style D fill:#95a5a6,color:#fff
-    style E fill:#95a5a6,color:#fff
-```
+The header polls `/healthz` every 30 seconds. "Send bad event" posts a payload containing `\u0000`: valid JSON that the API accepts, but that a JSONB column cannot store (SQLSTATE `22P05`), so it ends up in the DLQ.
 
 ---
 
-## Appendix: Project Structure Reference
+## 9. Known Limits and Next Steps
 
-```
-Event_Analytics_Platform/
-├── cmd/
-│   ├── ingestion_api/main.go        # HTTP server binary
-│   └── event-consumer/main.go       # Kafka consumer binary
-├── internal/
-│   ├── api/
-│   │   ├── router.go                # Chi route registration + CORS
-│   │   ├── handlers/event.go        # POST /v1/events handler
-│   │   ├── handlers/query.go        # GET /v1/events, /v1/analytics/* handlers
-│   │   └── middleware/
-│   │       ├── logging.go           # Request duration logging
-│   │       ├── request_id.go        # X-Request-ID propagation
-│   │       └── ratelimit.go         # (empty stub)
-│   ├── auth/apikey.go               # (empty stub)
-│   ├── config/config.go             # Env-based configuration
-│   ├── health/health.go             # /healthz, /readyz
-│   ├── logging/logger.go            # Structured logger
-│   ├── messaging/
-│   │   ├── producer.go              # Kafka writer (events topic)
-│   │   ├── consumer.go              # Kafka reader (manual commit)
-│   │   ├── dlq.go                   # Dead-letter queue producer
-│   │   ├── errors.go                # Error classification engine
-│   │   ├── retry.go                 # Bounded exponential backoff
-│   │   ├── errors_test.go           # Classification unit tests
-│   │   ├── retry_test.go            # Retry discipline tests
-│   │   ├── dlq_test.go              # DLQ envelope tests
-│   │   └── failure_injection_test.go # 8 failure scenario tests
-│   ├── storage/postgres.go          # PostgreSQL client (insert + query layer)
-│   └── validation/even.go           # (empty stub)
-├── migrations/
-│   ├── 000001_create_events_table.up.sql
-│   └── 000001_create_events_table.down.sql
-├── Event_Analytics_Platform/frontend/
-│   ├── index.html                   # Vite entry point
-│   ├── package.json                 # React 18, Router 6, Recharts, Lucide, date-fns
-│   ├── vite.config.ts               # Dev server + API proxy to :8080
-│   ├── tsconfig.json                # Strict TypeScript config
-│   └── src/
-│       ├── main.tsx                 # React root mount
-│       ├── App.tsx                  # BrowserRouter + route definitions
-│       ├── components/
-│       │   ├── Layout.tsx           # Sidebar + Header + Outlet
-│       │   ├── Sidebar.tsx          # Navigation with active route highlighting
-│       │   ├── Header.tsx           # Page title + live health badge
-│       │   ├── StatsCard.tsx        # Single metric card
-│       │   ├── EventTable.tsx       # Clickable event rows
-│       │   ├── EventChart.tsx       # Area, Pie, Bar charts (Recharts)
-│       │   ├── Filters.tsx          # Type + date range filters
-│       │   ├── Loading.tsx          # Spinner component
-│       │   └── StatusBadge.tsx      # Color-coded status indicator
-│       ├── pages/
-│       │   ├── Dashboard.tsx        # Stats + timeline + type dist + recent events
-│       │   ├── Events.tsx           # Filterable, paginated event list
-│       │   ├── EventDetail.tsx      # Single event metadata + JSON viewer
-│       │   ├── Analytics.tsx        # Configurable charts (6h–7d)
-│       │   └── DLQ.tsx              # DLQ envelope docs + roadmap
-│       ├── hooks/useApi.ts          # Generic data-fetching hook
-│       ├── services/api.ts          # Typed API client (fetch-based)
-│       ├── types/index.ts           # TypeScript interfaces
-│       ├── utils/formatters.ts      # Date/number formatters
-│       └── styles/index.css         # Dark-theme CSS (custom properties)
-├── deploy/
-│   ├── docker/Dockerfile.ingestion  # (empty)
-│   └── k8s/                         # (all empty stubs)
-├── desgin/                           # Architecture decision records
-├── docker-compose.yml                # Kafka + ZooKeeper + PostgreSQL
-├── go.mod
-└── README.md
-```
+| Limit | Next step |
+|---|---|
+| Single Kafka broker, replication factor 1 | 3 brokers, replication factor 3, `min.insync.replicas=2` |
+| No metrics | Prometheus counters (accepted, stored, retried, dead-lettered), consumer lag |
+| Consumer and recorder have no health endpoint | Small `/healthz` server in both |
+| No DLQ replay | `POST /v1/dlq/{id}/replay` and a dashboard button |
+| No authentication or rate limiting | API keys and a token-bucket limiter |
+| One message at a time per consumer | Batch inserts if throughput becomes a problem |
+| No frontend unit tests | Vitest for the API client and the DLQ page |

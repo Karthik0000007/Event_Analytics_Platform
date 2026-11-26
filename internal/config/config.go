@@ -10,7 +10,6 @@ import (
 type Config struct {
 	ServiceName string
 	Port        string
-	LogLevel    string
 
 	KafkaBrokers  []string
 	KafkaTopic    string
@@ -27,7 +26,6 @@ func Load() *Config {
 	return &Config{
 		ServiceName:   getEnv("SERVICE_NAME", "ingestion-api"),
 		Port:          getEnv("PORT", "8080"),
-		LogLevel:      getEnv("LOG_LEVEL", "info"),
 		KafkaBrokers:  strings.Split(getEnv("KAFKA_BROKERS", "localhost:9093"), ","),
 		KafkaTopic:    getEnv("KAFKA_TOPIC", "events"),
 		KafkaGroupID:  getEnv("KAFKA_GROUP_ID", "event-consumer-group"),
