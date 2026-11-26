@@ -1,39 +1,34 @@
-# Frontend Application
+# web: Event Analytics dashboard
 
-This directory contains the frontend application for the Event Analytics Platform. The application is built using React and TypeScript, and it serves as the user interface for interacting with the backend event analytics services.
+React 18 + TypeScript + Vite dashboard for the Event Analytics Platform.
+It reads from the Go ingestion API (`/v1/...`) and shows events, analytics and dead letters.
 
-## Project Structure
+## Run with Docker (recommended)
 
-- **package.json**: Configuration file for npm, listing dependencies and scripts.
-- **tsconfig.json**: TypeScript configuration file specifying compiler options.
-- **vite.config.ts**: Configuration file for Vite, the build tool used for serving the application.
-- **public/index.html**: Main HTML file that serves as the entry point for the application.
-- **src/**: Contains the source code for the application.
-  - **main.tsx**: Entry point of the React application.
-  - **App.tsx**: Main application component that sets up routing and includes other components.
-  - **components/**: Contains reusable components.
-    - **Header.tsx**: Header component for the application.
-  - **pages/**: Contains page components.
-    - **Home.tsx**: Home page component.
-  - **hooks/**: Contains custom hooks.
-    - **useApi.ts**: Custom hook for handling API calls.
-  - **services/**: Contains functions for making API requests.
-    - **api.ts**: API request functions.
-  - **styles/**: Contains global CSS styles.
-    - **index.css**: Global styles for the application.
-  - **types/**: Contains TypeScript interfaces and types.
-    - **index.ts**: Type definitions used throughout the application.
+From the repo root:
 
-## Setup Instructions
+```bash
+docker compose up --build
+```
 
-1. **Install Dependencies**: Run `npm install` to install the required dependencies.
-2. **Run the Application**: Use `npm run dev` to start the development server.
-3. **Build for Production**: Use `npm run build` to create a production build of the application.
+The dashboard is served by nginx at http://localhost:3000.
+nginx proxies `/v1`, `/healthz` and `/readyz` to the `api` service.
 
-## Usage Guidelines
+## Run for development
 
-- The application is designed to interact with the backend Event Analytics Platform.
-- Ensure that the backend services are running before starting the frontend application.
-- Modify the components and pages as needed to fit the requirements of your application.
+The Go API must be running on port 8080 (for example from `docker compose up`).
 
-For more detailed information on each file and component, refer to the respective files in the `src` directory.
+```bash
+cd web
+npm install
+npm run dev      # http://localhost:3000, proxies API calls to localhost:8080
+npm run build    # type-check and build into dist/
+```
+
+## Structure
+
+- `src/pages/`: Dashboard, Events, EventDetail, Analytics, DLQ
+- `src/components/`: layout, tables, charts, filters, toast
+- `src/services/api.ts`: typed fetch client for the API
+- `src/types/`: TypeScript types that mirror the API responses
+- `Dockerfile` and `nginx.conf`: production image (build with node, serve with nginx)

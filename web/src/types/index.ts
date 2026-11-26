@@ -60,3 +60,28 @@ export interface EventTableProps {
   loading?: boolean;
   onRowClick?: (event: EventRecord) => void;
 }
+/* ── Dead letters ───────────────────────────────────── */
+
+export interface DeadLetter {
+  id: number;
+  original_key: string;
+  original_value: string;
+  error_kind: 'transient' | 'permanent' | 'unknown' | string;
+  error_message: string;
+  retry_count: number;
+  failed_at: string; // ISO-8601
+  kafka_partition: number;
+  kafka_offset: number;
+}
+
+export interface DeadLetterListResponse {
+  dead_letters: DeadLetter[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface AcceptedResponse {
+  status: string;
+  event_id: string;
+}

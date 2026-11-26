@@ -1,4 +1,6 @@
 import type {
+  AcceptedResponse,
+  DeadLetterListResponse,
   EventListResponse,
   EventRecord,
   EventFilters,
@@ -9,11 +11,19 @@ import type {
 
 const BASE = '/v1';
 
+/** Fetch JSON. On an error status, throw the API's {"error": "..."} message. */
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, init);
   if (!res.ok) {
-    const text = await res.text().catch(() => res.statusText);
-    throw new Error(text || `HTTP ${res.status}`);
+    const text = await res.text().catch(() => '');
+    let message = text || `HTTP ${res.status}`;
+    try {
+      const body = JSON.parse(text) as { error?: string };
+      if (body.error) message = body.error;
+    } catch {
+      /* not JSON, keep the raw text */
+    }
+    throw new Error(`${message} (HTTP ${res.status})`);
   }
   return res.json();
 }
@@ -40,12 +50,55 @@ export async function createEvent(data: {
   event_id: string;
   event_type: string;
   payload: Record<string, unknown>;
-}): Promise<{ status: string; event_id: string }> {
+}): Promise<AcceptedResponse> {
   return request(`${BASE}/events`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data),
   });
+}
+
+/** A random UUID. crypto.randomUUID only exists on https or localhost. */
+export function newEventId(): string {
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+    return crypto.randomUUID();
+  }
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16);
+  });
+}
+
+const DEMO_TYPES = ['click', 'page_view', 'add_to_cart', 'purchase', 'signup'];
+
+/** Send a valid random event. It should appear on the Events page. */
+export function sendTestEvent(): Promise<AcceptedResponse> {
+  const type = DEMO_TYPES[Math.floor(Math.random() * DEMO_TYPES.length)];
+  return createEvent({
+    event_id: newEventId(),
+    event_type: type,
+    payload: { source: 'dashboard', page: '/demo', value: Math.round(Math.random() * 100) },
+  });
+}
+
+/**
+ * Send an event the API accepts but PostgreSQL rejects.
+ * The payload holds the NUL character (\u0000). It is valid JSON, but a JSONB
+ * column cannot store it (SQLSTATE 22P05). The consumer classifies that as a
+ * permanent error and routes the message to the DLQ.
+ */
+export function sendBadEvent(): Promise<AcceptedResponse> {
+  return createEvent({
+    event_id: newEventId(),
+    event_type: 'bad_event',
+    payload: { note: 'Postgres JSONB cannot store this character: \u0000' },
+  });
+}
+
+/* ── Dead letters ───────────────────────────────────── */
+
+export async function fetchDeadLetters(limit: number, offset: number): Promise<DeadLetterListResponse> {
+  return request<DeadLetterListResponse>(`${BASE}/dlq?limit=${limit}&offset=${offset}`);
 }
 
 /* ── Analytics ──────────────────────────────────────── */

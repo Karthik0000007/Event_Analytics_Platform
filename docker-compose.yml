@@ -4,10 +4,10 @@
 # Startup order:
 #   zookeeper -> kafka (healthy) -> kafka-init (creates topics, exits)
 #   postgres (healthy) -> migrate (applies migrations/, exits)
-#   then api, consumer and dlq-recorder.
+#   then api, consumer, dlq-recorder, and finally web.
 #
 # Inside the network, services use container hostnames (kafka:29092, postgres:5432).
-# From your machine: API http://localhost:8080,
+# From your machine: dashboard http://localhost:3000, API http://localhost:8080,
 # Kafka localhost:9093, Postgres localhost:5432.
 name: event-analytics
 
@@ -162,6 +162,16 @@ services:
         condition: service_completed_successfully
       migrate:
         condition: service_completed_successfully
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./web
+    ports:
+      - "3000:80"
+    depends_on:
+      api:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:
