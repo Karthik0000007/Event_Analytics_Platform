@@ -4,7 +4,7 @@
 # Startup order:
 #   zookeeper -> kafka (healthy) -> kafka-init (creates topics, exits)
 #   postgres (healthy) -> migrate (applies migrations/, exits)
-#   then api and consumer.
+#   then api, consumer and dlq-recorder.
 #
 # Inside the network, services use container hostnames (kafka:29092, postgres:5432).
 # From your machine: API http://localhost:8080,
@@ -142,6 +142,21 @@ services:
       <<: *backend-env
       KAFKA_GROUP_ID: event-consumer-group
       MAX_RETRIES: "5"
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  dlq-recorder:
+    build:
+      context: .
+      args:
+        SERVICE: dlq-recorder
+    environment:
+      <<: *backend-env
+      KAFKA_GROUP_ID: dlq-recorder-group
     depends_on:
       kafka-init:
         condition: service_completed_successfully

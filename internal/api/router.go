@@ -37,6 +37,9 @@ func NewRouter(publisher handlers.Publisher, db *storage.DB, logger *logging.Log
 		r.Get("/analytics/summary", qh.GetSummary)
 		r.Get("/analytics/types", qh.GetTypeCounts)
 		r.Get("/analytics/timeline", qh.GetTimeline)
+
+		// Dead letters, written to Postgres by cmd/dlq-recorder
+		r.Get("/dlq", (&handlers.DLQHandler{Store: db}).List)
 	})
 
 	return r
