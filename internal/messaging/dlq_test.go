@@ -28,7 +28,7 @@ func TestDLQMessage_Serialization(t *testing.T) {
 		OriginalPartition: original.Partition,
 		OriginalOffset:    original.Offset,
 		OriginalKey:       string(original.Key),
-		OriginalValue:     original.Value,
+		OriginalValue:     string(original.Value),
 		ErrorMessage:      "db insert failed",
 		ErrorKind:         ErrTransient.String(),
 		Retries:           3,
@@ -79,5 +79,23 @@ func TestDLQProducer_SendWithCancelledContext(t *testing.T) {
 	err := dlq.Send(ctx, msg, errors.New("test"), ErrPermanent, 1)
 	if err == nil {
 		t.Error("expected error when sending to DLQ with cancelled context")
+	}
+}
+
+func TestDLQMessage_PoisonPillValueSurvivesMarshal(t *testing.T) {
+	// A poison pill is not valid JSON. The envelope must still serialize,
+	// otherwise the message could never reach the DLQ.
+	envelope := DLQMessage{OriginalValue: string([]byte(`{not json`)), ErrorKind: "permanent"}
+
+	data, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatalf("envelope with invalid JSON value must marshal: %v", err)
+	}
+	var decoded DLQMessage
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded.OriginalValue != `{not json` {
+		t.Errorf("original value changed: %q", decoded.OriginalValue)
 	}
 }

@@ -23,8 +23,8 @@ func NewConsumer(brokers []string, topic, groupID string) *Consumer {
 		MinBytes:       1,
 		MaxBytes:       10e6, // 10 MB
 		MaxWait:        1 * time.Second,
-		CommitInterval: 0, // disable auto-commit
-		StartOffset:    kafka.LastOffset,
+		CommitInterval: 0,                 // disable auto-commit
+		StartOffset:    kafka.FirstOffset, // a new group starts at the oldest message, so nothing is skipped
 	})
 
 	return &Consumer{reader: r}

@@ -114,3 +114,39 @@ func TestErrorKind_String(t *testing.T) {
 		t.Error("unexpected string for unknown ErrorKind")
 	}
 }
+
+// fakeSQLError behaves like *pq.Error: it carries a Postgres SQLSTATE code.
+type fakeSQLError struct{ code string }
+
+func (e fakeSQLError) Error() string    { return "pq: error " + e.code }
+func (e fakeSQLError) SQLState() string { return e.code }
+
+func TestClassify_PostgresSQLState(t *testing.T) {
+	tests := []struct {
+		code string
+		want ErrorKind
+	}{
+		{"22P05", ErrPermanent}, // unsupported Unicode escape (\u0000 in JSONB)
+		{"22P02", ErrPermanent}, // invalid text representation (bad UUID)
+		{"23505", ErrPermanent}, // unique violation
+		{"23514", ErrPermanent}, // check violation
+		{"08006", ErrTransient}, // connection failure
+		{"53300", ErrTransient}, // too many connections
+		{"57P01", ErrTransient}, // admin shutdown (Postgres is stopping)
+		{"40P01", ErrTransient}, // deadlock detected
+		{"", ErrTransient},      // malformed code
+	}
+	for _, tc := range tests {
+		wrapped := fmt.Errorf("insert event: %w", fakeSQLError{tc.code})
+		if got := Classify(wrapped); got != tc.want {
+			t.Errorf("SQLSTATE %q: want %v, got %v", tc.code, tc.want, got)
+		}
+	}
+}
+
+func TestProcessingError_MessageWithoutCause(t *testing.T) {
+	err := NewPermanent("missing event_id or event_type", nil)
+	if err.Error() != "[permanent] missing event_id or event_type" {
+		t.Errorf("unexpected message: %q", err.Error())
+	}
+}
