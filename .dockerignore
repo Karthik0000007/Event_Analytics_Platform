@@ -1,0 +1,8 @@
+.git
+.vscode
+web
+docs
+scripts
+*.exe
+*.exe~
+*.md
