@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/Karthik0000007/Event_Analytics_Platform/internal/messaging"
+	"github.com/Karthik0000007/Event_Analytics_Platform/internal/logging"
 	"github.com/google/uuid"
 )
 
@@ -16,7 +16,13 @@ type EventRequest struct {
 	Payload json.RawMessage `json:"payload"`
 }
 
-func HandleEvent(producer *messaging.Producer) http.HandlerFunc {
+// Publisher sends an event to the message broker.
+// *messaging.Producer implements it; tests can use a fake.
+type Publisher interface {
+	Publish(ctx context.Context, key string, event any) error
+}
+
+func HandleEvent(publisher Publisher, logger *logging.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req EventRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -33,7 +39,9 @@ func HandleEvent(producer *messaging.Producer) http.HandlerFunc {
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			producer.Publish(ctx, req.EventID, req)
+			if err := publisher.Publish(ctx, req.EventID, req); err != nil {
+				logger.Error("kafka publish failed", map[string]any{"event_id": req.EventID, "error": err.Error()})
+			}
 		}()
 
 		w.Header().Set("Content-Type", "application/json")

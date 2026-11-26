@@ -6,27 +6,28 @@ import (
 	"github.com/Karthik0000007/Event_Analytics_Platform/internal/api/handlers"
 	"github.com/Karthik0000007/Event_Analytics_Platform/internal/api/middleware"
 	"github.com/Karthik0000007/Event_Analytics_Platform/internal/health"
-	"github.com/Karthik0000007/Event_Analytics_Platform/internal/messaging"
+	"github.com/Karthik0000007/Event_Analytics_Platform/internal/logging"
 	"github.com/Karthik0000007/Event_Analytics_Platform/internal/storage"
 	"github.com/go-chi/chi/v5"
 )
 
-func NewRouter(producer *messaging.Producer, db *storage.DB) http.Handler {
+// NewRouter wires every route to its handler.
+// publisher sends accepted events to Kafka; db serves the read endpoints.
+func NewRouter(publisher handlers.Publisher, db *storage.DB, logger *logging.Logger) http.Handler {
 	r := chi.NewRouter()
 
-	// Global middleware
 	r.Use(middleware.RequestID)
-	r.Use(middleware.Logging)
+	r.Use(middleware.Logging(logger))
 	r.Use(corsMiddleware)
 
 	r.Get("/healthz", health.Liveness)
-	r.Get("/readyz", health.Readiness)
+	r.Get("/readyz", health.Readiness(db))
 
 	qh := &handlers.QueryHandlers{DB: db}
 
 	r.Route("/v1", func(r chi.Router) {
 		// Write
-		r.Post("/events", handlers.HandleEvent(producer))
+		r.Post("/events", handlers.HandleEvent(publisher, logger))
 
 		// Read
 		r.Get("/events", qh.ListEvents)
@@ -41,11 +42,12 @@ func NewRouter(producer *messaging.Producer, db *storage.DB) http.Handler {
 	return r
 }
 
-// corsMiddleware allows the frontend dev server to reach the API.
+// corsMiddleware lets the Vite dev server (port 3000) call the API directly.
+// In Docker the dashboard goes through the nginx proxy, so CORS is not needed there.
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Request-ID")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)

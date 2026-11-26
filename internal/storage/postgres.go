@@ -221,3 +221,9 @@ type Event struct {
 func (db *DB) Close() error {
 	return db.conn.Close()
 }
+
+// Ping checks that the database is reachable. Used by /readyz and by the
+// consumer to tell "this message is bad" apart from "the database is down".
+func (db *DB) Ping(ctx context.Context) error {
+	return db.conn.PingContext(ctx)
+}

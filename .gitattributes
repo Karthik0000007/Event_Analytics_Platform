@@ -1,0 +1,12 @@
+# Keep LF line endings in the repo and in the working tree, on every OS.
+# gofmt, shell scripts and Docker builds all expect LF.
+* text=auto eol=lf
+
+# PowerShell scripts are for Windows users.
+*.ps1 text eol=crlf
+
+# Binary files
+*.png binary
+*.gif binary
+*.jpg binary
+*.ico binary
