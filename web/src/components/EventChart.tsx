@@ -32,9 +32,11 @@ interface TimelineChartProps {
 }
 
 export const TimelineChart: React.FC<TimelineChartProps> = ({ data, height = 300 }) => {
+  // The API returns one point per hour. Windows longer than a day also show the date.
+  const pattern = data.length > 24 ? 'MMM d HH:mm' : 'HH:mm';
   const formatted = data.map((d) => ({
     ...d,
-    label: format(parseISO(d.bucket), 'HH:mm'),
+    label: format(parseISO(d.bucket), pattern),
   }));
 
   return (
