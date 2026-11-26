@@ -184,16 +184,24 @@ type TimelinePoint struct {
 	Count  int       `json:"count"`
 }
 
-// GetTimeline returns event counts grouped by hour for the last 24 hours.
+// timelineSQL returns one row per hour for the last $1 hours, including the
+// current hour. generate_series creates every hour, and the LEFT JOIN gives
+// hours without events a count of 0, so charts show gaps as zero, not as missing points.
+const timelineSQL = `
+	SELECT b.bucket, COUNT(e.event_id)
+	FROM generate_series(
+		date_trunc('hour', NOW()) - ($1::int - 1) * INTERVAL '1 hour',
+		date_trunc('hour', NOW()),
+		INTERVAL '1 hour'
+	) AS b(bucket)
+	LEFT JOIN events e
+		ON e.received_at >= b.bucket AND e.received_at < b.bucket + INTERVAL '1 hour'
+	GROUP BY b.bucket
+	ORDER BY b.bucket`
+
+// GetTimeline returns the event count for each of the last `hours` hours.
 func (db *DB) GetTimeline(ctx context.Context, hours int) ([]TimelinePoint, error) {
-	query := `
-		SELECT date_trunc('hour', received_at) AS bucket, COUNT(*)
-		FROM events
-		WHERE received_at >= NOW() - ($1 || ' hours')::INTERVAL
-		GROUP BY bucket
-		ORDER BY bucket
-	`
-	rows, err := db.conn.QueryContext(ctx, query, fmt.Sprintf("%d", hours))
+	rows, err := db.conn.QueryContext(ctx, timelineSQL, hours)
 	if err != nil {
 		return nil, fmt.Errorf("timeline: %w", err)
 	}
@@ -220,4 +228,10 @@ type Event struct {
 // Close shuts down the connection pool.
 func (db *DB) Close() error {
 	return db.conn.Close()
+}
+
+// Ping checks that the database is reachable. Used by /readyz and by the
+// consumer to tell "this message is bad" apart from "the database is down".
+func (db *DB) Ping(ctx context.Context) error {
+	return db.conn.PingContext(ctx)
 }

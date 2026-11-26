@@ -1,13 +1,13 @@
 package handlers
 
 import (
-	"encoding/json"
 	"net/http"
 	"strconv"
 	"time"
 
 	"github.com/Karthik0000007/Event_Analytics_Platform/internal/storage"
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 )
 
 // QueryHandlers holds read-only handlers backed by the database.
@@ -44,15 +44,14 @@ func (q *QueryHandlers) ListEvents(w http.ResponseWriter, r *http.Request) {
 
 	events, total, err := q.DB.GetEvents(r.Context(), eventType, from, to, limit, offset)
 	if err != nil {
-		http.Error(w, "failed to query events", http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "failed to query events")
 		return
 	}
 	if events == nil {
 		events = []storage.Event{}
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	writeJSON(w, http.StatusOK, map[string]any{
 		"events": events,
 		"total":  total,
 		"limit":  limit,
@@ -63,43 +62,46 @@ func (q *QueryHandlers) ListEvents(w http.ResponseWriter, r *http.Request) {
 // GetEvent handles GET /v1/events/{id}
 func (q *QueryHandlers) GetEvent(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	if uuid.Validate(id) != nil {
+		writeError(w, http.StatusBadRequest, "event id must be a UUID")
+		return
+	}
 	event, err := q.DB.GetEvent(r.Context(), id)
 	if err != nil {
-		http.Error(w, "failed to get event", http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "failed to get event")
 		return
 	}
 	if event == nil {
-		http.Error(w, "event not found", http.StatusNotFound)
+		writeError(w, http.StatusNotFound, "event not found")
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(event)
+	writeJSON(w, http.StatusOK, event)
 }
 
 // GetSummary handles GET /v1/analytics/summary
 func (q *QueryHandlers) GetSummary(w http.ResponseWriter, r *http.Request) {
 	summary, err := q.DB.GetSummary(r.Context())
 	if err != nil {
-		http.Error(w, "failed to get summary", http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "failed to get summary")
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(summary)
+
+	writeJSON(w, http.StatusOK, summary)
 }
 
 // GetTypeCounts handles GET /v1/analytics/types
 func (q *QueryHandlers) GetTypeCounts(w http.ResponseWriter, r *http.Request) {
 	counts, err := q.DB.GetTypeCounts(r.Context())
 	if err != nil {
-		http.Error(w, "failed to get type counts", http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "failed to get type counts")
 		return
 	}
 	if counts == nil {
 		counts = []storage.TypeCount{}
 	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(counts)
+
+	writeJSON(w, http.StatusOK, counts)
 }
 
 // GetTimeline handles GET /v1/analytics/timeline?hours=24
@@ -110,12 +112,12 @@ func (q *QueryHandlers) GetTimeline(w http.ResponseWriter, r *http.Request) {
 	}
 	points, err := q.DB.GetTimeline(r.Context(), hours)
 	if err != nil {
-		http.Error(w, "failed to get timeline", http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "failed to get timeline")
 		return
 	}
 	if points == nil {
 		points = []storage.TimelinePoint{}
 	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(points)
+
+	writeJSON(w, http.StatusOK, points)
 }

@@ -1,25 +1,82 @@
+# One command runs the whole platform:
+#   docker compose up --build
+#
+# Startup order:
+#   zookeeper -> kafka (healthy) -> kafka-init (creates topics, exits)
+#   postgres (healthy) -> migrate (applies migrations/, exits)
+#   then api, consumer, dlq-recorder, and finally web.
+#
+# Inside the network, services use container hostnames (kafka:29092, postgres:5432).
+# From your machine: dashboard http://localhost:3000, API http://localhost:8080,
+# Kafka localhost:9093, Postgres localhost:5432.
+name: event-analytics
+
+x-backend-env: &backend-env
+  KAFKA_BROKERS: kafka:29092
+  KAFKA_TOPIC: events
+  KAFKA_DLQ_TOPIC: events.dlq
+  DB_HOST: postgres
+  DB_PORT: "5432"
+  DB_USER: events_user
+  DB_PASSWORD: events_password
+  DB_NAME: events_db
+
 services:
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
-    ports:
-      - "2181:2181"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/2181'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
 
   kafka:
     image: confluentinc/cp-kafka:7.5.0
     depends_on:
-      - zookeeper
+      zookeeper:
+        condition: service_healthy
     ports:
-      - "9093:9092"
+      - "9093:9092" # for tools running on your machine
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      # Two listeners: one for containers (kafka:29092), one for the host (localhost:9093).
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9093
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Topics are created explicitly by kafka-init, never by accident.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:29092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 15s
+    restart: unless-stopped
+
+  # One-shot job: create the topics, then exit.
+  kafka-init:
+    image: confluentinc/cp-kafka:7.5.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic events --partitions 3 --replication-factor 1
+        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic events.dlq --partitions 1 --replication-factor 1
+        kafka-topics --bootstrap-server kafka:29092 --list
+    restart: "no"
 
   postgres:
     image: postgres:15-alpine
@@ -31,6 +88,91 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U events_user -d events_db"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  # One-shot job: apply every migration in migrations/, then exit.
+  migrate:
+    image: migrate/migrate:v4.17.1
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./migrations:/migrations:ro
+    command:
+      - "-path=/migrations"
+      - "-database=postgres://events_user:events_password@postgres:5432/events_db?sslmode=disable"
+      - "up"
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      args:
+        SERVICE: ingestion_api
+    environment:
+      <<: *backend-env
+      SERVICE_NAME: ingestion-api
+      PORT: "8080"
+    ports:
+      - "8080:8080"
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      # Liveness only: the API keeps accepting events while Postgres is down.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  consumer:
+    build:
+      context: .
+      args:
+        SERVICE: event-consumer
+    environment:
+      <<: *backend-env
+      KAFKA_GROUP_ID: event-consumer-group
+      MAX_RETRIES: "5"
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  dlq-recorder:
+    build:
+      context: .
+      args:
+        SERVICE: dlq-recorder
+    environment:
+      <<: *backend-env
+      KAFKA_GROUP_ID: dlq-recorder-group
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./web
+    ports:
+      - "3000:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   postgres_data:

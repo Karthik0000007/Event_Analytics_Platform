@@ -18,7 +18,7 @@ func NewProducer(brokers []string, topic string) *Producer {
 		Addr:         kafka.TCP(brokers...),
 		Topic:        topic,
 		RequiredAcks: kafka.RequireAll,
-		Balancer:     &kafka.LeastBytes{},
+		Balancer:     &kafka.Hash{}, // same key -> same partition, so one event is always handled in order
 		BatchTimeout: 10 * time.Millisecond,
 	}
 

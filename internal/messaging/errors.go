@@ -9,17 +9,12 @@ import (
 	"syscall"
 )
 
-// ──────────────────────────────────────────────────────────────
-// Error classification: transient vs permanent
-// ──────────────────────────────────────────────────────────────
-
-// ErrorKind categorises a processing failure so the consumer can
-// decide whether to retry (transient) or route to DLQ (permanent).
+// ErrorKind says whether a failure is worth retrying.
 type ErrorKind int
 
 const (
-	ErrTransient ErrorKind = iota // e.g. DB timeout, Kafka broker hiccup
-	ErrPermanent                  // e.g. malformed JSON, constraint violation
+	ErrTransient ErrorKind = iota // e.g. database down, timeout, broker hiccup
+	ErrPermanent                  // e.g. malformed JSON, a value Postgres rejects
 )
 
 func (k ErrorKind) String() string {
@@ -33,7 +28,7 @@ func (k ErrorKind) String() string {
 	}
 }
 
-// ProcessingError wraps an underlying error with classification metadata.
+// ProcessingError wraps an error with an explicit classification.
 type ProcessingError struct {
 	Kind    ErrorKind
 	Cause   error
@@ -41,6 +36,9 @@ type ProcessingError struct {
 }
 
 func (e *ProcessingError) Error() string {
+	if e.Cause == nil {
+		return fmt.Sprintf("[%s] %s", e.Kind, e.Message)
+	}
 	return fmt.Sprintf("[%s] %s: %v", e.Kind, e.Message, e.Cause)
 }
 
@@ -56,48 +54,67 @@ func NewPermanent(msg string, cause error) *ProcessingError {
 	return &ProcessingError{Kind: ErrPermanent, Cause: cause, Message: msg}
 }
 
-// Classify inspects an error and returns whether it is transient or permanent.
-// Network errors, timeouts, connection resets → transient.
-// Everything else (bad JSON, constraint violations) → permanent.
+// sqlStateError is implemented by *pq.Error. Using an interface keeps this
+// package free of a direct dependency on the Postgres driver.
+type sqlStateError interface {
+	SQLState() string
+}
+
+// Classify decides whether err is transient (retry) or permanent (DLQ).
+// Order of checks:
+//  1. an explicit ProcessingError
+//  2. the Postgres SQLSTATE code, when the error has one
+//  3. network and I/O errors
+//  4. known message text, for errors without a code
+//  5. anything unknown is transient, because retrying is safer than discarding
 func Classify(err error) ErrorKind {
 	if err == nil {
-		return ErrTransient // should not be called with nil, but safe default
+		return ErrTransient
 	}
 
-	// Explicit classification already present
 	var pe *ProcessingError
 	if errors.As(err, &pe) {
 		return pe.Kind
 	}
 
-	// Network / IO errors are transient
+	var se sqlStateError
+	if errors.As(err, &se) {
+		return classifySQLState(se.SQLState())
+	}
+
 	var netErr net.Error
 	if errors.As(err, &netErr) {
 		return ErrTransient
 	}
-	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
-		return ErrTransient
-	}
-	if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET) {
+	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) ||
+		errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET) {
 		return ErrTransient
 	}
 
-	// Postgres unique-violation / check-constraint → permanent
 	msg := err.Error()
 	if strings.Contains(msg, "unique constraint") ||
 		strings.Contains(msg, "violates check constraint") ||
 		strings.Contains(msg, "invalid input syntax") {
 		return ErrPermanent
 	}
+	return ErrTransient
+}
 
-	// Connection-related postgres errors → transient
-	if strings.Contains(msg, "connection refused") ||
-		strings.Contains(msg, "connection reset") ||
-		strings.Contains(msg, "timeout") ||
-		strings.Contains(msg, "too many clients") {
+// classifySQLState maps a Postgres error code to a kind. The first two
+// characters are the error class:
+//
+//	22 data exception (bad value, e.g. \u0000 inside JSONB) -> permanent
+//	23 integrity constraint violation                        -> permanent
+//	anything else (08 connection, 53 resources,
+//	57 admin shutdown, 40 deadlock, ...)                     -> transient
+func classifySQLState(code string) ErrorKind {
+	if len(code) < 2 {
 		return ErrTransient
 	}
-
-	// Unknown errors default to transient so we retry rather than discard.
-	return ErrTransient
+	switch code[:2] {
+	case "22", "23":
+		return ErrPermanent
+	default:
+		return ErrTransient
+	}
 }

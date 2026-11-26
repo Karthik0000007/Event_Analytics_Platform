@@ -4,214 +4,212 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"testing"
 	"time"
 
+	"github.com/Karthik0000007/Event_Analytics_Platform/internal/logging"
 	"github.com/segmentio/kafka-go"
 )
 
 // ──────────────────────────────────────────────────────────────
 // Failure injection scenarios
 //
-// These tests verify the consumer's decision logic under various
-// failure modes WITHOUT requiring a running Kafka / Postgres.
-// They exercise classification → retry → DLQ routing paths.
+// These tests run the real Processor (the code the consumer binary uses)
+// against fakes for Postgres, the DLQ and the offset committer, so they
+// need no running Kafka or Postgres.
 // ──────────────────────────────────────────────────────────────
 
-// --- helpers ---
+// fakeStore fails inserts and pings according to the functions it is given.
+type fakeStore struct {
+	insertErr func(call int) error // nil means every insert succeeds
+	pingErr   func(call int) error // nil means every ping succeeds
+	inserts   int
+	pings     int
+	stored    []string
+}
 
-type insertFunc func(ctx context.Context, id, typ string, payload json.RawMessage) error
-
-// simulateProcessing mirrors the consumer's processMessage logic
-// in a unit-testable form. Returns (dlqSent, retries, finalErr).
-func simulateProcessing(
-	rawValue []byte,
-	insertFn insertFunc,
-	retryCfg RetryConfig,
-) (dlqSent bool, dlqKind ErrorKind, retries int, finalErr error) {
-	// Step 1: Unmarshal (poison pill check)
-	var evt struct {
-		EventID   string          `json:"event_id"`
-		EventType string          `json:"event_type"`
-		Payload   json.RawMessage `json:"payload"`
-	}
-	if err := json.Unmarshal(rawValue, &evt); err != nil {
-		return true, ErrPermanent, 0, err
-	}
-
-	// Step 2: Validate required fields
-	if evt.EventID == "" || evt.EventType == "" {
-		return true, ErrPermanent, 0, NewPermanent("missing required fields", nil)
-	}
-
-	// Step 3: Bounded retry loop
-	for attempt := 0; ; attempt++ {
-		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-		err := insertFn(ctx, evt.EventID, evt.EventType, evt.Payload)
-		cancel()
-
-		if err == nil {
-			return false, 0, attempt, nil
+func (f *fakeStore) InsertEvent(_ context.Context, id, _ string, _ json.RawMessage) error {
+	f.inserts++
+	if f.insertErr != nil {
+		if err := f.insertErr(f.inserts); err != nil {
+			return err
 		}
+	}
+	f.stored = append(f.stored, id)
+	return nil
+}
 
-		kind := Classify(err)
+func (f *fakeStore) Ping(context.Context) error {
+	f.pings++
+	if f.pingErr != nil {
+		return f.pingErr(f.pings)
+	}
+	return nil
+}
 
-		if kind == ErrPermanent {
-			return true, kind, attempt + 1, err
-		}
-		if !retryCfg.ShouldRetry(kind, attempt) {
-			return true, kind, attempt + 1, err
-		}
-		// (skip sleep in tests)
+// fakeDLQ records dead letters. The first failFirst sends return an error.
+type fakeDLQ struct {
+	failFirst int
+	attempts  int
+	kinds     []ErrorKind
+	retries   []int
+}
+
+func (f *fakeDLQ) Send(_ context.Context, _ kafka.Message, _ error, kind ErrorKind, retries int) error {
+	f.attempts++
+	if f.attempts <= f.failFirst {
+		return errors.New("kafka: broker not available")
+	}
+	f.kinds = append(f.kinds, kind)
+	f.retries = append(f.retries, retries)
+	return nil
+}
+
+// fakeOffsets records which offsets were committed.
+type fakeOffsets struct{ committed []int64 }
+
+func (f *fakeOffsets) CommitMessage(_ context.Context, msg kafka.Message) error {
+	f.committed = append(f.committed, msg.Offset)
+	return nil
+}
+
+// fastRetry keeps tests quick: tiny delays, MaxRetries retries.
+func fastRetry(maxRetries int) RetryConfig {
+	return RetryConfig{MaxRetries: maxRetries, BaseDelay: time.Millisecond, MaxDelay: 2 * time.Millisecond, Multiplier: 2}
+}
+
+type harness struct {
+	store   *fakeStore
+	dlq     *fakeDLQ
+	offsets *fakeOffsets
+	proc    *Processor
+}
+
+func newHarness(store *fakeStore, dlq *fakeDLQ, maxRetries int) *harness {
+	offsets := &fakeOffsets{}
+	return &harness{
+		store: store, dlq: dlq, offsets: offsets,
+		proc: &Processor{
+			Store: store, DLQ: dlq, Offsets: offsets,
+			Retry:      fastRetry(maxRetries),
+			Logger:     logging.NewWriter("test", io.Discard),
+			OutagePoll: time.Millisecond,
+		},
 	}
 }
+
+func message(offset int64, value string) kafka.Message {
+	return kafka.Message{Topic: "events", Offset: offset, Value: []byte(value)}
+}
+
+const goodEvent = `{"event_id":"e1","event_type":"click","payload":{}}`
 
 // ── Scenario 1: Poison pill (invalid JSON) ────────────────────
 
 func TestFailureInjection_PoisonPill_InvalidJSON(t *testing.T) {
-	raw := []byte(`{not-valid-json!!!}`)
-	insert := func(ctx context.Context, id, typ string, payload json.RawMessage) error {
-		t.Fatal("insert should never be called for poison pill")
-		return nil
-	}
+	h := newHarness(&fakeStore{}, &fakeDLQ{}, 5)
 
-	dlqSent, kind, retries, err := simulateProcessing(raw, insert, DefaultRetryConfig())
-
-	if !dlqSent {
-		t.Error("expected poison pill to be routed to DLQ")
+	if err := h.proc.Process(context.Background(), message(7, `{not-valid-json!!!}`)); err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if kind != ErrPermanent {
-		t.Errorf("expected permanent error, got %v", kind)
+	if h.store.inserts != 0 {
+		t.Error("insert must never be called for a poison pill")
 	}
-	if retries != 0 {
-		t.Errorf("expected 0 retries for poison pill, got %d", retries)
+	if len(h.dlq.kinds) != 1 || h.dlq.kinds[0] != ErrPermanent || h.dlq.retries[0] != 0 {
+		t.Errorf("expected one permanent dead letter with 0 retries, got kinds=%v retries=%v", h.dlq.kinds, h.dlq.retries)
 	}
-	if err == nil {
-		t.Error("expected non-nil error")
+	if len(h.offsets.committed) != 1 || h.offsets.committed[0] != 7 {
+		t.Errorf("expected offset 7 committed after DLQ, got %v", h.offsets.committed)
 	}
 }
 
 // ── Scenario 2: Poison pill (missing required fields) ─────────
 
 func TestFailureInjection_PoisonPill_MissingFields(t *testing.T) {
-	raw := []byte(`{"event_id":"","event_type":"click","payload":{}}`)
-	insert := func(ctx context.Context, id, typ string, payload json.RawMessage) error {
-		t.Fatal("insert should never be called for missing fields")
-		return nil
-	}
+	h := newHarness(&fakeStore{}, &fakeDLQ{}, 5)
 
-	dlqSent, kind, _, _ := simulateProcessing(raw, insert, DefaultRetryConfig())
+	_ = h.proc.Process(context.Background(), message(1, `{"event_id":"","event_type":"click","payload":{}}`))
 
-	if !dlqSent {
-		t.Error("expected missing-field message to be routed to DLQ")
-	}
-	if kind != ErrPermanent {
-		t.Error("expected permanent classification for missing fields")
+	if h.store.inserts != 0 || len(h.dlq.kinds) != 1 || h.dlq.kinds[0] != ErrPermanent {
+		t.Errorf("expected permanent DLQ without insert, got inserts=%d kinds=%v", h.store.inserts, h.dlq.kinds)
 	}
 }
 
 // ── Scenario 3: Transient failure recovers within budget ──────
 
 func TestFailureInjection_TransientRecovery(t *testing.T) {
-	callCount := 0
-	insert := func(ctx context.Context, id, typ string, payload json.RawMessage) error {
-		callCount++
-		if callCount < 3 {
-			return errors.New("connection refused") // transient
+	store := &fakeStore{insertErr: func(call int) error {
+		if call < 3 {
+			return errors.New("connection refused")
 		}
-		return nil // succeeds on 3rd call
-	}
+		return nil
+	}}
+	h := newHarness(store, &fakeDLQ{}, 5)
 
-	raw := []byte(`{"event_id":"e1","event_type":"click","payload":{}}`)
-	rc := DefaultRetryConfig()
-	rc.MaxRetries = 5
+	_ = h.proc.Process(context.Background(), message(2, goodEvent))
 
-	dlqSent, _, retries, err := simulateProcessing(raw, insert, rc)
-
-	if dlqSent {
-		t.Error("expected successful processing, not DLQ")
+	if store.inserts != 3 || len(store.stored) != 1 {
+		t.Errorf("expected success on the 3rd insert, got inserts=%d stored=%v", store.inserts, store.stored)
 	}
-	if err != nil {
-		t.Errorf("expected nil error, got %v", err)
+	if len(h.dlq.kinds) != 0 {
+		t.Error("a recovered transient error must not reach the DLQ")
 	}
-	if retries != 2 { // 0-indexed: attempts 0, 1 failed; 2 succeeded
-		t.Errorf("expected 2 retries before success, got %d", retries)
+	if len(h.offsets.committed) != 1 {
+		t.Errorf("expected exactly one commit, got %v", h.offsets.committed)
 	}
 }
 
-// ── Scenario 4: Transient failure exhausts retry budget ───────
+// ── Scenario 4: Transient failure exhausts budget while the DB is healthy ──
 
 func TestFailureInjection_TransientExhaustsRetries(t *testing.T) {
-	insert := func(ctx context.Context, id, typ string, payload json.RawMessage) error {
-		return errors.New("connection reset by peer") // always transient
-	}
+	store := &fakeStore{insertErr: func(int) error { return errors.New("connection reset by peer") }}
+	h := newHarness(store, &fakeDLQ{}, 3)
 
-	raw := []byte(`{"event_id":"e2","event_type":"view","payload":{}}`)
-	rc := DefaultRetryConfig()
-	rc.MaxRetries = 3
+	_ = h.proc.Process(context.Background(), message(3, goodEvent))
 
-	dlqSent, kind, retries, err := simulateProcessing(raw, insert, rc)
-
-	if !dlqSent {
-		t.Error("expected DLQ routing after exhausting retries")
+	if store.inserts != 4 {
+		t.Errorf("expected 4 attempts (1 + 3 retries), got %d", store.inserts)
 	}
-	if kind != ErrTransient {
-		t.Errorf("expected transient classification, got %v", kind)
-	}
-	if retries != 4 {
-		t.Errorf("expected 4 attempts (3 retries + 1 final), got %d", retries)
-	}
-	if err == nil {
-		t.Error("expected non-nil error")
+	if len(h.dlq.kinds) != 1 || h.dlq.kinds[0] != ErrTransient || h.dlq.retries[0] != 4 {
+		t.Errorf("expected one transient dead letter after 4 attempts, got kinds=%v retries=%v", h.dlq.kinds, h.dlq.retries)
 	}
 }
 
 // ── Scenario 5: Permanent failure (constraint violation) ──────
 
 func TestFailureInjection_PermanentConstraintViolation(t *testing.T) {
-	insert := func(ctx context.Context, id, typ string, payload json.RawMessage) error {
+	store := &fakeStore{insertErr: func(int) error {
 		return errors.New(`pq: value too long violates check constraint "events_type_len"`)
-	}
+	}}
+	h := newHarness(store, &fakeDLQ{}, 5)
 
-	raw := []byte(`{"event_id":"e3","event_type":"x","payload":{}}`)
-	rc := DefaultRetryConfig()
-	rc.MaxRetries = 5
+	_ = h.proc.Process(context.Background(), message(4, goodEvent))
 
-	dlqSent, kind, retries, _ := simulateProcessing(raw, insert, rc)
-
-	if !dlqSent {
-		t.Error("expected DLQ for permanent error")
+	if store.inserts != 1 {
+		t.Errorf("expected exactly 1 attempt (no retries), got %d", store.inserts)
 	}
-	if kind != ErrPermanent {
-		t.Error("expected permanent classification")
-	}
-	if retries != 1 {
-		t.Errorf("expected exactly 1 attempt (no retries), got %d", retries)
+	if len(h.dlq.kinds) != 1 || h.dlq.kinds[0] != ErrPermanent {
+		t.Errorf("expected a permanent dead letter, got %v", h.dlq.kinds)
 	}
 }
 
 // ── Scenario 6: First call succeeds (happy path) ─────────────
 
 func TestFailureInjection_HappyPath(t *testing.T) {
-	insert := func(ctx context.Context, id, typ string, payload json.RawMessage) error {
-		return nil
-	}
+	h := newHarness(&fakeStore{}, &fakeDLQ{}, 5)
 
-	raw := []byte(`{"event_id":"e4","event_type":"purchase","payload":{"amount":99}}`)
-	dlqSent, _, retries, err := simulateProcessing(raw, insert, DefaultRetryConfig())
+	_ = h.proc.Process(context.Background(), message(5, goodEvent))
 
-	if dlqSent {
-		t.Error("expected no DLQ for successful processing")
+	if h.store.inserts != 1 || len(h.dlq.kinds) != 0 {
+		t.Errorf("expected one insert and no DLQ, got inserts=%d dlq=%v", h.store.inserts, h.dlq.kinds)
 	}
-	if err != nil {
-		t.Errorf("expected nil error, got %v", err)
-	}
-	if retries != 0 {
-		t.Errorf("expected 0 retries for happy path, got %d", retries)
+	if len(h.offsets.committed) != 1 || h.offsets.committed[0] != 5 {
+		t.Errorf("expected offset 5 committed, got %v", h.offsets.committed)
 	}
 }
 
-// ── Scenario 7: Verify DLQ envelope contains full context ────
+// ── Scenario 7: DLQ envelope keeps the full context ───────────
 
 func TestFailureInjection_DLQEnvelopeContainsContext(t *testing.T) {
 	original := kafka.Message{
@@ -228,7 +226,7 @@ func TestFailureInjection_DLQEnvelopeContainsContext(t *testing.T) {
 		OriginalPartition: original.Partition,
 		OriginalOffset:    original.Offset,
 		OriginalKey:       string(original.Key),
-		OriginalValue:     original.Value,
+		OriginalValue:     string(original.Value),
 		ErrorMessage:      reason.Error(),
 		ErrorKind:         reason.Kind.String(),
 		Retries:           2,
@@ -245,32 +243,18 @@ func TestFailureInjection_DLQEnvelopeContainsContext(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
-	// Verify all context is preserved
-	if decoded.OriginalTopic != "events" {
-		t.Error("original topic lost")
+	if decoded.OriginalTopic != "events" || decoded.OriginalPartition != 1 || decoded.OriginalOffset != 100 {
+		t.Error("original topic, partition or offset lost")
 	}
-	if decoded.OriginalPartition != 1 {
-		t.Error("original partition lost")
-	}
-	if decoded.OriginalOffset != 100 {
-		t.Error("original offset lost")
-	}
-	if decoded.OriginalKey != "user-123" {
-		t.Error("original key lost")
-	}
-	if decoded.ErrorKind != "permanent" {
-		t.Error("error kind lost")
-	}
-	if decoded.Retries != 2 {
-		t.Error("retry count lost")
+	if decoded.OriginalKey != "user-123" || decoded.ErrorKind != "permanent" || decoded.Retries != 2 {
+		t.Error("key, error kind or retry count lost")
 	}
 
-	// Verify original event can still be deserialized
 	var evt struct {
 		EventID   string `json:"event_id"`
 		EventType string `json:"event_type"`
 	}
-	if err := json.Unmarshal(decoded.OriginalValue, &evt); err != nil {
+	if err := json.Unmarshal([]byte(decoded.OriginalValue), &evt); err != nil {
 		t.Fatal("could not deserialize original event from DLQ envelope")
 	}
 	if evt.EventID != "e5" || evt.EventType != "click" {
@@ -278,27 +262,83 @@ func TestFailureInjection_DLQEnvelopeContainsContext(t *testing.T) {
 	}
 }
 
-// ── Scenario 8: Zero-retry config sends to DLQ immediately ───
+// ── Scenario 8: Zero-retry config sends to DLQ after one attempt ──
 
 func TestFailureInjection_ZeroRetriesGoStraightToDLQ(t *testing.T) {
-	insert := func(ctx context.Context, id, typ string, payload json.RawMessage) error {
-		return errors.New("connection timeout")
-	}
+	store := &fakeStore{insertErr: func(int) error { return errors.New("connection timeout") }}
+	h := newHarness(store, &fakeDLQ{}, 0)
 
-	raw := []byte(`{"event_id":"e6","event_type":"view","payload":{}}`)
-	rc := RetryConfig{
-		MaxRetries: 0, // no retries allowed
-		BaseDelay:  time.Millisecond,
-		MaxDelay:   time.Millisecond,
-		Multiplier: 1,
-	}
+	_ = h.proc.Process(context.Background(), message(6, goodEvent))
 
-	dlqSent, _, retries, _ := simulateProcessing(raw, insert, rc)
-
-	if !dlqSent {
-		t.Error("expected DLQ with zero-retry config")
+	if store.inserts != 1 || len(h.dlq.kinds) != 1 {
+		t.Errorf("expected 1 attempt then DLQ, got inserts=%d dlq=%v", store.inserts, h.dlq.kinds)
 	}
-	if retries != 1 {
-		t.Errorf("expected 1 attempt, got %d", retries)
+}
+
+// ── Scenario 9: Database outage pauses instead of dead-lettering ──
+
+func TestFailureInjection_DatabaseOutagePausesThenRecovers(t *testing.T) {
+	const outageInserts = 4 // inserts fail until the database "comes back"
+	store := &fakeStore{
+		insertErr: func(call int) error {
+			if call <= outageInserts {
+				return errors.New("dial tcp: lookup postgres: no such host")
+			}
+			return nil
+		},
+		// The first two pings fail (database down), then it answers again.
+		pingErr: func(call int) error {
+			if call <= 2 {
+				return errors.New("connection refused")
+			}
+			return nil
+		},
+	}
+	h := newHarness(store, &fakeDLQ{}, 2)
+
+	if err := h.proc.Process(context.Background(), message(8, goodEvent)); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(h.dlq.kinds) != 0 {
+		t.Fatalf("an outage must not send events to the DLQ, got %v", h.dlq.kinds)
+	}
+	if len(store.stored) != 1 || len(h.offsets.committed) != 1 {
+		t.Errorf("expected the event stored and committed once, got stored=%v committed=%v", store.stored, h.offsets.committed)
+	}
+}
+
+// ── Scenario 10: DLQ write fails, offset waits until it succeeds ──
+
+func TestFailureInjection_DLQWriteFailureDoesNotCommitEarly(t *testing.T) {
+	dlq := &fakeDLQ{failFirst: 2}
+	h := newHarness(&fakeStore{}, dlq, 5)
+
+	_ = h.proc.Process(context.Background(), message(9, `not json`))
+
+	if dlq.attempts != 3 || len(dlq.kinds) != 1 {
+		t.Errorf("expected 2 failed DLQ writes then 1 success, got attempts=%d sent=%d", dlq.attempts, len(dlq.kinds))
+	}
+	if len(h.offsets.committed) != 1 {
+		t.Errorf("expected a single commit after the DLQ write succeeded, got %v", h.offsets.committed)
+	}
+}
+
+// ── Scenario 11: Shutdown during retries leaves the offset uncommitted ──
+
+func TestFailureInjection_ShutdownDuringRetryDoesNotCommit(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	store := &fakeStore{insertErr: func(int) error {
+		cancel() // simulate SIGTERM arriving while the insert is failing
+		return errors.New("connection refused")
+	}}
+	h := newHarness(store, &fakeDLQ{}, 5)
+
+	err := h.proc.Process(ctx, message(10, goodEvent))
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+	if len(h.offsets.committed) != 0 || len(h.dlq.kinds) != 0 {
+		t.Errorf("shutdown must not commit or dead-letter, got commits=%v dlq=%v", h.offsets.committed, h.dlq.kinds)
 	}
 }

@@ -12,15 +12,15 @@ import (
 // DLQMessage wraps the original message with failure metadata so
 // operators can inspect, diagnose, and optionally replay it.
 type DLQMessage struct {
-	OriginalTopic     string          `json:"original_topic"`
-	OriginalPartition int             `json:"original_partition"`
-	OriginalOffset    int64           `json:"original_offset"`
-	OriginalKey       string          `json:"original_key"`
-	OriginalValue     json.RawMessage `json:"original_value"`
-	ErrorMessage      string          `json:"error_message"`
-	ErrorKind         string          `json:"error_kind"` // "transient" | "permanent"
-	Retries           int             `json:"retries"`
-	FailedAt          time.Time       `json:"failed_at"`
+	OriginalTopic     string    `json:"original_topic"`
+	OriginalPartition int       `json:"original_partition"`
+	OriginalOffset    int64     `json:"original_offset"`
+	OriginalKey       string    `json:"original_key"`
+	OriginalValue     string    `json:"original_value"` // raw bytes as text, because poison pills are not valid JSON
+	ErrorMessage      string    `json:"error_message"`
+	ErrorKind         string    `json:"error_kind"` // "transient" | "permanent"
+	Retries           int       `json:"retries"`
+	FailedAt          time.Time `json:"failed_at"`
 }
 
 // DLQProducer writes failed messages to a dead-letter topic.
@@ -48,7 +48,7 @@ func (d *DLQProducer) Send(ctx context.Context, original kafka.Message, reason e
 		OriginalPartition: original.Partition,
 		OriginalOffset:    original.Offset,
 		OriginalKey:       string(original.Key),
-		OriginalValue:     original.Value,
+		OriginalValue:     string(original.Value),
 		ErrorMessage:      reason.Error(),
 		ErrorKind:         kind.String(),
 		Retries:           retries,

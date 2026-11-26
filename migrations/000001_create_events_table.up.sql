@@ -5,5 +5,5 @@ CREATE TABLE IF NOT EXISTS events (
     received_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_events_type ON events (event_type);
-CREATE INDEX idx_events_received_at ON events (received_at);
+CREATE INDEX IF NOT EXISTS idx_events_type ON events (event_type);
+CREATE INDEX IF NOT EXISTS idx_events_received_at ON events (received_at);
